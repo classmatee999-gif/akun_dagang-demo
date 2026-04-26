@@ -194,6 +194,10 @@ async def monitor_daily_loss(app):
             if emergency_stop:
                 await asyncio.sleep(60)
                 continue
+            # Skip jika tidak ada pair aktif
+            if not any(pair_active.values()):
+                await asyncio.sleep(30)
+                continue
             all_trades = get_all_open_trades()
             total_pl   = sum(float(t["unrealizedPL"]) for t in all_trades)
             limit      = settings["daily_loss_limit"]
