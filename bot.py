@@ -7,7 +7,7 @@ from oandapyV20.endpoints import orders, trades, instruments, accounts
 import pandas as pd
 import os
 
-TELEGRAM_TOKEN  = os.environ.get("AAFwI8cYBQiuIc14eH03FNZKrE1-ooIUJj4")
+TELEGRAM_TOKEN  = os.environ.get("8721338927")
 OANDA_TOKEN     = os.environ.get("0bfbe1cc9698a5b93a60b46b5bae86c9-34b23230db37270e68d96d5bc0b256ac")
 ACCOUNT_ID      = os.environ.get("101-001-29134814-001")
 ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "6903511431"))
