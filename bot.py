@@ -21,8 +21,8 @@ ALL_PAIRS = [
 
 settings = {
     "lot_size":       0.01,
-    "layer_trigger":  -2.0,
-    "total_tp":       10.0,
+    "layer_trigger":  -5.0,
+    "total_tp":       30.0,
     "check_interval": 60,
     "ema_fast":       20,
     "ema_slow":       50,
