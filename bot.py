@@ -15,7 +15,7 @@ import numpy as np
 TELEGRAM_TOKEN   = "8721338927:AAFwI8cYBQiuIc14eH03FNZKrE1-ooIUJj4"
 OANDA_TOKEN      = "0bfbe1cc9698a5b93a60b46b5bae86c9-34b23230db37270e68d96d5bc0b256ac"
 ACCOUNT_ID       = "101-001-29134814-001"
-ALLOWED_USER_ID  = 123456789          # Ganti dengan Telegram user ID kamu
+ALLOWED_USER_ID  = 6903511431          # Ganti dengan Telegram user ID kamu
 INSTRUMENT       = "EUR_USD"
 LOT_SIZE         = 0.01               # Fixed lot
 LAYER_TRIGGER    = -2.0               # Entry lagi kalau posisi terakhir floating -$2
