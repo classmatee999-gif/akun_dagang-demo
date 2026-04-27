@@ -832,36 +832,37 @@ def text_main():
     now = now_wib()
     trading_ok, trading_reason = is_trading_time()
     news_pause, news_ev        = is_news_time()
-    estop = "🚨 EMERGENCY STOP" if emergency_stop else "✅ Normal"
-    trade_status = "✅ Entry OK" if (trading_ok and not news_pause) else (
-        "📰 Pause: {}".format(news_ev["title"][:20] if news_ev else "News") if news_pause
-        else "⏰ {}".format(trading_reason)
-    )
-    return (
-        "🤖 *Forex Bot v3*\n\n"
-        "Status: {}\n"
-        "Entry: {}\n"
-        "Waktu WIB: `{}`\n"
-        "Uptime: `{}`\n"
-        "Pair aktif: `{}/{}`\n\n"
-        "🎯 TP: `${}` \\| 🛑 SL: `${}`\n"
-        "📉 Layer: `${}` max `{}`\n"
-        "📡 ADX: `{}` \\| 📍 Trailing: `{}`\n"
-        "⏰ Hours: `{}`\n"
-        "📰 News Filter: `{}`\n\n"
-        "Pilih menu:"
-    ).format(
-        estop, trade_status,
-        em(now.strftime("%H:%M WIB %a")),
-        em(uptime_str()),
-        active_pair_count(), settings["max_active_pairs"],
-        em(str(s["total_tp"])), em(str(s["hard_sl"])),
-        em(str(s["layer_trigger"])), s["max_layers"],
-        "ON" if s["adx_filter"] else "OFF",
-        "ON" if s["trailing_tp"] else "OFF",
-        "ON" if s["trading_hours"] else "OFF",
-        "ON" if s["news_filter"] else "OFF",
-    )
+    estop        = "🚨 EMERGENCY STOP" if emergency_stop else "✅ Normal"
+    if news_pause:
+        title = news_ev["title"][:20] if news_ev else "News"
+        trade_status = "📰 Pause: {}".format(em(title))
+    elif not trading_ok:
+        trade_status = "⏰ {}".format(em(trading_reason))
+    else:
+        trade_status = "✅ Entry OK"
+
+    adx_s  = "ON" if s["adx_filter"]     else "OFF"
+    ttp_s  = "ON" if s["trailing_tp"]    else "OFF"
+    th_s   = "ON" if s["trading_hours"]  else "OFF"
+    nf_s   = "ON" if s["news_filter"]    else "OFF"
+
+    lines = [
+        "🤖 *Forex Bot v3*",
+        "",
+        "Status: {}".format(estop),
+        "Entry: {}".format(trade_status),
+        "Waktu WIB: `{}`".format(em(now.strftime("%H:%M %a"))),
+        "Uptime: `{}`".format(em(uptime_str())),
+        "Pair aktif: `{}/{}`".format(active_pair_count(), settings["max_active_pairs"]),
+        "",
+        "🎯 TP: `${}` \\| 🛑 SL: `${}`".format(em(str(s["total_tp"])), em(str(s["hard_sl"]))),
+        "📉 Layer: `${}` max `{}`".format(em(str(s["layer_trigger"])), s["max_layers"]),
+        "📡 ADX: `{}` \\| 📍 Trailing: `{}`".format(adx_s, ttp_s),
+        "⏰ Hours: `{}` \\| 📰 News: `{}`".format(th_s, nf_s),
+        "",
+        "Pilih menu:",
+    ]
+    return "\n".join(lines)
 
 async def text_positions():
     lines = ["📈 *Status Posisi*\n"]
