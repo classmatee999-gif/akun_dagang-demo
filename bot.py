@@ -22,7 +22,7 @@ OANDA_ENV       = os.environ.get("OANDA_ENV", "practice")
 
 ALL_PAIRS = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "AUD_USD",
-    "USD_CAD", "NZD_USD", "EUR_GBP", "EUR_JPY", "GBP_JPY",
+    "USD_CAD", "NZD_USD", "EUR_GBP", "EUR_JPY",
     "AUD_JPY", "EUR_AUD", "EUR_CAD", "GBP_CAD", "CAD_JPY",
 ]
 
@@ -1041,6 +1041,27 @@ async def start_command(update, context):
     if not bot_start_time: bot_start_time = datetime.now()
     await update.message.reply_text(text_main(), parse_mode="MarkdownV2", reply_markup=kb_main())
 
+async def testentry_command(update, context):
+    if not is_allowed(update): return
+    await update.message.reply_text("Menjalankan test entry...")
+    results = []
+    for direction in ["buy", "sell"]:
+        try:
+            units = "1000" if direction == "buy" else "-1000"
+            r = orders.OrderCreate(ACCOUNT_ID, data={
+                "order": {"type": "MARKET", "instrument": "EUR_USD", "units": units}
+            })
+            client.request(r)
+            trade_id = r.response["orderFillTransaction"]["tradeOpened"]["tradeID"]
+            results.append("OK {} - Trade ID: {}".format(direction.upper(), trade_id))
+            await asyncio.sleep(1)
+            client.request(trades.TradeClose(ACCOUNT_ID, tradeID=trade_id))
+            results.append("OK {} closed.".format(direction.upper()))
+        except Exception as e:
+            results.append("FAIL {}: {}".format(direction.upper(), str(e)))
+    msg = "Test Entry Result:\n\n" + "\n".join(results)
+    await update.message.reply_text(msg)
+
 async def button_handler(update, context):
     global emergency_stop
     query = update.callback_query
@@ -1239,6 +1260,7 @@ async def post_init(app):
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("testentry", testentry_command))
     app.add_handler(CommandHandler("menu",  start_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_setting_value))
