@@ -69,6 +69,9 @@ settings = {
     "notify_interval":      3600,
 }
 
+# Pair yang terbukti tidak tersedia di akun ini — diisi otomatis saat error
+unavailable_pairs = set()
+
 pair_active         = {p: False for p in ALL_PAIRS}
 pair_tasks          = {}
 pair_state          = {
@@ -87,11 +90,6 @@ margin_warned       = False   # Sudah kirim warning margin hari ini?
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 client = oandapyV20.API(access_token=OANDA_TOKEN, environment=OANDA_ENV)
-
-
-# ══════════════════════════════════════════
-# UTILS
-# ══════════════════════════════════════════
 
 def pair_label(pair):   return pair.replace("_", "/")
 def em(text):
@@ -243,9 +241,15 @@ def get_upcoming_news(max_events=5):
 # ══════════════════════════════════════════
 
 def get_candles(pair, count=60, granularity="D"):
-    r = instruments.InstrumentsCandles(pair, params={"count": count, "granularity": granularity})
-    client.request(r)
-    return r.response["candles"]
+    import requests as _req
+    url = "https://api-fxpractice.oanda.com/v3/instruments/{}/candles".format(pair)
+    if OANDA_ENV == "live":
+        url = "https://api-fxtrade.oanda.com/v3/instruments/{}/candles".format(pair)
+    headers = {"Authorization": "Bearer {}".format(OANDA_TOKEN)}
+    params  = {"count": count, "granularity": granularity, "price": "M"}
+    resp    = _req.get(url, headers=headers, params=params, timeout=10)
+    resp.raise_for_status()
+    return resp.json()["candles"]
 
 def get_closes(pair, count=60):
     candles = get_candles(pair, count)
@@ -695,7 +699,20 @@ async def trading_loop_pair(pair, app):
                                         ), parse_mode="MarkdownV2")
 
         except Exception as e:
+            err_str = str(e)
             logger.error("[%s] %s", pair, e)
+            # Pair tidak tersedia — nonaktifkan permanen
+            if "Insufficient authorization" in err_str or "No instrument" in err_str:
+                unavailable_pairs.add(pair)
+                stop_pair(pair)
+                try:
+                    await app.bot.send_message(ALLOWED_USER_ID,
+                        "Pair {} tidak tersedia di akun ini, dinonaktifkan otomatis.".format(
+                            pair_label(pair)))
+                except Exception:
+                    pass
+                return  # Keluar dari loop pair ini selamanya
+            # Error lain — kirim notif tapi tetap jalan
             try:
                 await app.bot.send_message(ALLOWED_USER_ID,
                     "⚠️ *{}* error: `{}`".format(em(pair_label(pair)), em(str(e))),
@@ -709,6 +726,7 @@ async def trading_loop_pair(pair, app):
 
 def start_pair(pair, app):
     if pair_active.get(pair): return False
+    if pair in unavailable_pairs: return "unavailable"
     if active_pair_count() >= settings["max_active_pairs"]: return "max"
     pair_active[pair] = True
     pair_state[pair]  = {"last_signal": None, "waiting_cross": None, "peak_profit": 0.0}
@@ -751,7 +769,12 @@ def kb_pairs(page=0):
     total_pages = (len(ALL_PAIRS) + per_page - 1) // per_page
     rows = []
     for pair in page_pairs:
-        icon = "✅" if pair_active.get(pair) else "⭕"
+        if pair in unavailable_pairs:
+            icon = "🚫"
+        elif pair_active.get(pair):
+            icon = "✅"
+        else:
+            icon = "⭕"
         rows.append([InlineKeyboardButton("{} {}".format(icon, pair_label(pair)), callback_data="toggle_" + pair)])
     nav = []
     if page > 0:
@@ -1103,6 +1126,8 @@ async def button_handler(update, context):
             result = start_pair(pair, context.application)
             if result == "max":
                 await query.answer("⚠️ Maks {} pair!".format(settings["max_active_pairs"]), show_alert=True); return
+            if result == "unavailable":
+                await query.answer("🚫 {} tidak tersedia di akun ini".format(pair_label(pair)), show_alert=True); return
             await query.answer("{} ✅ ON".format(pair_label(pair)))
         cnt, mx = active_pair_count(), settings["max_active_pairs"]
         try:
