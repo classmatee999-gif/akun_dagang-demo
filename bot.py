@@ -14,11 +14,11 @@ import os
 # ─────────────────────────────────────────
 # KONFIGURASI
 # ─────────────────────────────────────────
-TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "")
-OANDA_TOKEN     = os.environ.get("OANDA_TOKEN", "")
-ACCOUNT_ID      = os.environ.get("ACCOUNT_ID", "")
-ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0"))
-OANDA_ENV       = os.environ.get("OANDA_ENV", "practice")
+TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "").strip()
+OANDA_TOKEN     = os.environ.get("OANDA_TOKEN", "").strip()
+ACCOUNT_ID      = os.environ.get("ACCOUNT_ID", "").strip()
+ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0").strip())
+OANDA_ENV       = os.environ.get("OANDA_ENV", "practice").strip()
 
 ALL_PAIRS = [
     "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "AUD_USD",
@@ -94,6 +94,20 @@ client = oandapyV20.API(access_token=OANDA_TOKEN, environment=OANDA_ENV)
 # Debug: log config saat startup (token disamarkan)
 _token_preview = OANDA_TOKEN[:6] + "..." + OANDA_TOKEN[-4:] if len(OANDA_TOKEN) > 10 else "EMPTY"
 logger.info("Config check — ENV: %s | ACCOUNT: %s | TOKEN: %s", OANDA_ENV, ACCOUNT_ID, _token_preview)
+
+# Test candles endpoint saat startup
+try:
+    import requests as _req
+    _base = "https://api-fxpractice.oanda.com" if OANDA_ENV == "practice" else "https://api-fxtrade.oanda.com"
+    _resp = _req.get(
+        "{}/v3/instruments/EUR_USD/candles".format(_base),
+        headers={"Authorization": "Bearer " + OANDA_TOKEN, "Content-Type": "application/json"},
+        params={"count": "5", "granularity": "D", "price": "M"},
+        timeout=10
+    )
+    logger.info("Candle test — status: %s | response: %s", _resp.status_code, _resp.text[:200])
+except Exception as _e:
+    logger.error("Candle test failed: %s", _e)
 
 def pair_label(pair):   return pair.replace("_", "/")
 def em(text):
@@ -245,11 +259,15 @@ def get_upcoming_news(max_events=5):
 # ══════════════════════════════════════════
 
 def get_candles(pair, count=60, granularity="D"):
-    # Gunakan oandapyV20 client yang sudah authenticated
-    from oandapyV20.endpoints.instruments import InstrumentsCandles
-    r = InstrumentsCandles(pair, params={"count": count, "granularity": granularity, "price": "M"})
-    client.request(r)
-    return r.response["candles"]
+    import requests as _req
+    base = "https://api-fxpractice.oanda.com" if OANDA_ENV == "practice" else "https://api-fxtrade.oanda.com"
+    url  = "{}/v3/instruments/{}/candles".format(base, pair)
+    resp = _req.get(url,
+        headers={"Authorization": "Bearer " + OANDA_TOKEN, "Content-Type": "application/json"},
+        params={"count": str(count), "granularity": granularity, "price": "M"},
+        timeout=10)
+    resp.raise_for_status()
+    return resp.json()["candles"]
 
 def get_closes(pair, count=60):
     candles = get_candles(pair, count)
