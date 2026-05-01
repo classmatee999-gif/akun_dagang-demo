@@ -91,6 +91,10 @@ logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=lo
 logger = logging.getLogger(__name__)
 client = oandapyV20.API(access_token=OANDA_TOKEN, environment=OANDA_ENV)
 
+# Debug: log config saat startup (token disamarkan)
+_token_preview = OANDA_TOKEN[:6] + "..." + OANDA_TOKEN[-4:] if len(OANDA_TOKEN) > 10 else "EMPTY"
+logger.info("Config check — ENV: %s | ACCOUNT: %s | TOKEN: %s", OANDA_ENV, ACCOUNT_ID, _token_preview)
+
 def pair_label(pair):   return pair.replace("_", "/")
 def em(text):
     text = str(text)
@@ -241,15 +245,11 @@ def get_upcoming_news(max_events=5):
 # ══════════════════════════════════════════
 
 def get_candles(pair, count=60, granularity="D"):
-    import requests as _req
-    url = "https://api-fxpractice.oanda.com/v3/instruments/{}/candles".format(pair)
-    if OANDA_ENV == "live":
-        url = "https://api-fxtrade.oanda.com/v3/instruments/{}/candles".format(pair)
-    headers = {"Authorization": "Bearer {}".format(OANDA_TOKEN)}
-    params  = {"count": count, "granularity": granularity, "price": "M"}
-    resp    = _req.get(url, headers=headers, params=params, timeout=10)
-    resp.raise_for_status()
-    return resp.json()["candles"]
+    # Gunakan oandapyV20 client yang sudah authenticated
+    from oandapyV20.endpoints.instruments import InstrumentsCandles
+    r = InstrumentsCandles(pair, params={"count": count, "granularity": granularity, "price": "M"})
+    client.request(r)
+    return r.response["candles"]
 
 def get_closes(pair, count=60):
     candles = get_candles(pair, count)
