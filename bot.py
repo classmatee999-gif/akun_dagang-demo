@@ -1,14 +1,16 @@
 import asyncio
 import logging
-from datetime import datetime, time as dtime
+from datetime import datetime, timedelta
+from collections import defaultdict
 import pytz
 import requests as req_lib
 import xml.etree.ElementTree as ET
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 import oandapyV20
-from oandapyV20.endpoints import orders, trades, instruments, accounts
+from oandapyV20.endpoints import orders, trades, accounts
 import pandas as pd
+import numpy as np
 import os
 
 # ─────────────────────────────────────────
@@ -21,9 +23,17 @@ ALLOWED_USER_ID = int(os.environ.get("ALLOWED_USER_ID", "0").strip())
 OANDA_ENV       = os.environ.get("OANDA_ENV", "practice").strip()
 
 ALL_PAIRS = [
-    "EUR_USD", "GBP_USD", "USD_JPY", "USD_CHF", "AUD_USD",
+    "EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD",
     "USD_CAD", "NZD_USD", "EUR_GBP", "EUR_JPY",
     "AUD_JPY", "EUR_AUD", "EUR_CAD", "GBP_CAD", "CAD_JPY",
+]
+
+# Korelasi pair — tidak boleh aktif bersamaan
+CORRELATION_GROUPS = [
+    {"EUR_USD", "GBP_USD", "EUR_GBP"},   # EUR & GBP majors
+    {"USD_JPY", "EUR_JPY", "AUD_JPY", "CAD_JPY"},  # JPY pairs
+    {"AUD_USD", "NZD_USD", "AUD_JPY", "EUR_AUD"},  # AUD/commodity
+    {"USD_CAD", "EUR_CAD", "GBP_CAD"},   # CAD pairs
 ]
 
 WIB = pytz.timezone("Asia/Jakarta")
@@ -31,83 +41,116 @@ WIB = pytz.timezone("Asia/Jakarta")
 settings = {
     # Entry
     "lot_size":             0.01,
-    "dynamic_lot":          True,   # Lot scaling otomatis berdasarkan balance
-    "dynamic_lot_per":      1000.0, # 0.01 lot per $1000 balance
+    "dynamic_lot":          True,
+    "dynamic_lot_per":      1000.0,
     "ema_fast":             20,
     "ema_slow":             50,
+    # Multi-timeframe
+    "mtf_enabled":          True,    # Konfirmasi H4
+    # RSI filter
+    "rsi_filter":           True,
+    "rsi_period":           14,
+    "rsi_buy_min":          50,      # RSI harus > ini untuk buy
+    "rsi_sell_max":         50,      # RSI harus < ini untuk sell
+    # ADX filter
+    "adx_filter":           True,
+    "adx_min":              20,
     # Layering
     "layer_trigger":        -10.0,
     "max_layers":           5,
+    "fib_layers":           True,    # Pakai Fibonacci untuk layer entry
     # Exit
     "total_tp":             25.0,
     "hard_sl":              -30.0,
     "trailing_tp":          True,
     "trailing_pullback":    3.0,
-    # Filter
-    "adx_filter":           True,
-    "adx_min":              20,
-    "max_active_pairs":     5,
-    # Trading Hours (WIB)
-    "trading_hours":        True,   # Hanya trade di jam aktif
-    "hour_start":           15,     # 15.00 WIB = London open
-    "hour_end":             23,     # 23.00 WIB = NY close
-    "skip_friday":          True,   # Skip entry Jumat > jam skip_friday_hour
-    "skip_friday_hour":     21,     # Jumat setelah jam ini = stop entry
-    "skip_monday":          True,   # Skip entry Senin < jam skip_monday_hour
-    "skip_monday_hour":     10,     # Senin sebelum jam ini = stop entry
-    # News filter
-    "news_filter":          True,   # Pause saat high-impact news
-    "news_pause_before":    30,     # Menit sebelum news
-    "news_pause_after":     30,     # Menit setelah news
-    # Margin protection
-    "margin_warning":       200.0,  # Alert kalau margin level < ini %
-    "margin_stop":          150.0,  # Stop semua entry kalau margin level < ini %
+    "partial_close":        True,    # Partial close saat profit >= partial_tp
+    "partial_tp":           15.0,    # Close 50% posisi saat profit >= ini
+    "partial_pct":          50,      # Persentase posisi yang di-close
+    "breakeven":            True,    # Pindah SL ke breakeven
+    "breakeven_trigger":    5.0,     # Trigger breakeven saat posisi pertama profit >= ini
+    # ATR
+    "atr_sl_tp":            True,    # Gunakan ATR untuk SL/TP dinamis
+    "atr_period":           14,
+    "atr_sl_mult":          1.5,     # SL = ATR * multiplier
+    "atr_tp_mult":          3.0,     # TP = ATR * multiplier
+    # Correlation
+    "correlation_filter":   True,
+    "max_corr_pairs":       1,       # Maks 1 pair aktif per grup korelasi
+    # Performance
+    "perf_tracking":        True,
+    "perf_min_trades":      10,      # Min trade sebelum evaluasi
+    "perf_min_winrate":     40,      # Nonaktifkan pair jika winrate < ini %
+    "drawdown_recovery":    True,    # Kurangi lot saat drawdown
+    "drawdown_threshold":   -20.0,   # Trigger recovery mode
+    # Trading Hours
+    "trading_hours":        True,
+    "hour_start":           15,
+    "hour_end":             23,
+    "skip_friday":          True,
+    "skip_friday_hour":     21,
+    "skip_monday":          True,
+    "skip_monday_hour":     10,
+    # News
+    "news_filter":          True,
+    "news_pause_before":    30,
+    "news_pause_after":     30,
+    # Margin
+    "margin_warning":       200.0,
+    "margin_stop":          150.0,
     # Risk global
+    "max_active_pairs":     5,
     "daily_loss_limit":     -100.0,
     # Bot
     "check_interval":       60,
     "notify_interval":      3600,
 }
 
-# Pair yang terbukti tidak tersedia di akun ini — diisi otomatis saat error
-unavailable_pairs = set()
-
+# ── State ──
 pair_active         = {p: False for p in ALL_PAIRS}
 pair_tasks          = {}
 pair_state          = {
-    p: {"last_signal": None, "waiting_cross": None, "peak_profit": 0.0}
+    p: {
+        "last_signal":      None,
+        "waiting_cross":    None,
+        "peak_profit":      0.0,
+        "partial_done":     False,   # Sudah partial close?
+        "breakeven_done":   False,   # Sudah set breakeven?
+        "entry_price":      None,    # Harga entry pertama
+        "atr_sl":           None,    # Dynamic SL dari ATR
+        "atr_tp":           None,    # Dynamic TP dari ATR
+    } for p in ALL_PAIRS
+}
+
+# Performance tracking per pair
+pair_perf = {
+    p: {"trades": 0, "wins": 0, "losses": 0, "total_pl": 0.0,
+        "disabled_by_perf": False, "peak_balance": 0.0}
     for p in ALL_PAIRS
 }
+
+unavailable_pairs   = set()
 pending_setting_key = {}
 bot_start_time      = None
 trade_log           = []
 daily_stats         = {"trades": 0, "wins": 0, "losses": 0, "total_pl": 0.0}
 emergency_stop      = False
-news_cache          = []      # Cache berita dari Forex Factory
+recovery_mode       = False   # Drawdown recovery mode
+news_cache          = []
 news_cache_time     = None
-margin_warned       = False   # Sudah kirim warning margin hari ini?
+margin_warned       = False
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 client = oandapyV20.API(access_token=OANDA_TOKEN, environment=OANDA_ENV)
 
-# Debug: log config saat startup (token disamarkan)
 _token_preview = OANDA_TOKEN[:6] + "..." + OANDA_TOKEN[-4:] if len(OANDA_TOKEN) > 10 else "EMPTY"
-logger.info("Config check — ENV: %s | ACCOUNT: %s | TOKEN: %s", OANDA_ENV, ACCOUNT_ID, _token_preview)
+logger.info("Config — ENV: %s | ACCOUNT: %s | TOKEN: %s", OANDA_ENV, ACCOUNT_ID, _token_preview)
 
-# Test candles endpoint saat startup
-try:
-    import requests as _req
-    _base = "https://api-fxpractice.oanda.com" if OANDA_ENV == "practice" else "https://api-fxtrade.oanda.com"
-    _resp = _req.get(
-        "{}/v3/instruments/EUR_USD/candles".format(_base),
-        headers={"Authorization": "Bearer " + OANDA_TOKEN, "Content-Type": "application/json"},
-        params={"count": "5", "granularity": "D", "price": "M"},
-        timeout=10
-    )
-    logger.info("Candle test — status: %s | response: %s", _resp.status_code, _resp.text[:200])
-except Exception as _e:
-    logger.error("Candle test failed: %s", _e)
+
+# ══════════════════════════════════════════
+# UTILS
+# ══════════════════════════════════════════
 
 def pair_label(pair):   return pair.replace("_", "/")
 def em(text):
@@ -117,6 +160,7 @@ def em(text):
     return text
 def is_allowed(update): return update.effective_user.id == ALLOWED_USER_ID
 def active_pair_count(): return sum(1 for p in ALL_PAIRS if pair_active.get(p))
+def now_wib():          return datetime.now(WIB)
 def uptime_str():
     if not bot_start_time: return "N/A"
     delta = datetime.now() - bot_start_time
@@ -124,208 +168,280 @@ def uptime_str():
     m, s   = divmod(rem, 60)
     return "{}j {}m {}d".format(h, m, s)
 
-def now_wib():
-    return datetime.now(WIB)
-
 def log_trade(pair, direction, action, pl=None):
     entry = {"time": datetime.now().strftime("%H:%M:%S"), "pair": pair_label(pair),
              "direction": direction, "action": action, "pl": pl}
     trade_log.append(entry)
-    if len(trade_log) > 100: trade_log.pop(0)
+    if len(trade_log) > 200: trade_log.pop(0)
     if pl is not None:
         daily_stats["trades"] += 1
         daily_stats["total_pl"] += pl
         if pl >= 0: daily_stats["wins"] += 1
         else:       daily_stats["losses"] += 1
+        # Update pair performance
+        pair_perf[pair]["trades"] += 1
+        pair_perf[pair]["total_pl"] += pl
+        if pl >= 0: pair_perf[pair]["wins"] += 1
+        else:       pair_perf[pair]["losses"] += 1
 
 
 # ══════════════════════════════════════════
-# TRADING HOURS CHECK
+# MARKET DATA
+# ══════════════════════════════════════════
+
+def get_candles_raw(pair, count=60, granularity="D"):
+    base = "https://api-fxpractice.oanda.com" if OANDA_ENV == "practice" else "https://api-fxtrade.oanda.com"
+    url  = "{}/v3/instruments/{}/candles".format(base, pair)
+    resp = req_lib.get(url,
+        headers={"Authorization": "Bearer " + OANDA_TOKEN, "Content-Type": "application/json"},
+        params={"count": str(count), "granularity": granularity, "price": "M"},
+        timeout=10)
+    if resp.status_code != 200:
+        raise Exception("{} {}".format(resp.status_code, resp.text))
+    data = resp.json()
+    if "candles" not in data:
+        raise Exception("No candles: {}".format(data))
+    return data["candles"]
+
+def get_closes(pair, count=60, granularity="D"):
+    candles = get_candles_raw(pair, count, granularity)
+    return [float(c["mid"]["c"]) for c in candles if c["complete"]]
+
+def get_ohlc(pair, count=60, granularity="D"):
+    candles = get_candles_raw(pair, count, granularity)
+    completed = [c for c in candles if c["complete"]]
+    return {
+        "opens":  [float(c["mid"]["o"]) for c in completed],
+        "highs":  [float(c["mid"]["h"]) for c in completed],
+        "lows":   [float(c["mid"]["l"]) for c in completed],
+        "closes": [float(c["mid"]["c"]) for c in completed],
+    }
+
+def calculate_ema(data, period):
+    return pd.Series(data).ewm(span=period, adjust=False).mean().tolist()
+
+def calculate_rsi(closes, period=14):
+    s      = pd.Series(closes)
+    delta  = s.diff()
+    gain   = delta.clip(lower=0).ewm(com=period-1, adjust=False).mean()
+    loss   = (-delta.clip(upper=0)).ewm(com=period-1, adjust=False).mean()
+    rs     = gain / loss
+    rsi    = 100 - (100 / (1 + rs))
+    return rsi.tolist()
+
+def calculate_adx(ohlc, period=14):
+    try:
+        highs, lows, closes = ohlc["highs"], ohlc["lows"], ohlc["closes"]
+        if len(closes) < period + 1: return 0
+        tr_list, pdm_list, ndm_list = [], [], []
+        for i in range(1, len(closes)):
+            h, l, pc = highs[i], lows[i], closes[i-1]
+            tr  = max(h - l, abs(h - pc), abs(l - pc))
+            pdm = max(h - highs[i-1], 0) if (h - highs[i-1]) > (lows[i-1] - l) else 0
+            ndm = max(lows[i-1] - l, 0)  if (lows[i-1] - l) > (h - highs[i-1]) else 0
+            tr_list.append(tr); pdm_list.append(pdm); ndm_list.append(ndm)
+        def smooth(data, p):
+            r = [sum(data[:p])]
+            for i in range(p, len(data)): r.append(r[-1] - r[-1]/p + data[i])
+            return r
+        atr  = smooth(tr_list, period)
+        pDIs = smooth(pdm_list, period)
+        nDIs = smooth(ndm_list, period)
+        dx_list = []
+        for i in range(len(atr)):
+            if atr[i] == 0: continue
+            pdi = 100 * pDIs[i] / atr[i]
+            ndi = 100 * nDIs[i] / atr[i]
+            dx  = 100 * abs(pdi - ndi) / (pdi + ndi) if (pdi + ndi) > 0 else 0
+            dx_list.append(dx)
+        if not dx_list: return 0
+        return round(sum(dx_list[-period:]) / period, 2)
+    except Exception as e:
+        logger.error("ADX error: %s", e)
+        return 0
+
+def calculate_atr(ohlc, period=14):
+    highs, lows, closes = ohlc["highs"], ohlc["lows"], ohlc["closes"]
+    trs = []
+    for i in range(1, len(closes)):
+        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+        trs.append(tr)
+    if not trs: return 0
+    atr = pd.Series(trs).ewm(span=period, adjust=False).mean().iloc[-1]
+    return round(atr, 5)
+
+def get_swing_fib_levels(pair):
+    """Hitung level Fibonacci dari swing high/low 20 candle terakhir."""
+    try:
+        ohlc       = get_ohlc(pair, count=30, granularity="D")
+        highs      = ohlc["highs"]
+        lows       = ohlc["lows"]
+        swing_high = max(highs[-20:])
+        swing_low  = min(lows[-20:])
+        diff       = swing_high - swing_low
+        return {
+            "high":   swing_high,
+            "low":    swing_low,
+            "fib382": swing_high - diff * 0.382,
+            "fib500": swing_high - diff * 0.500,
+            "fib618": swing_high - diff * 0.618,
+        }
+    except Exception:
+        return None
+
+def get_ema_signal_mtf(pair):
+    """
+    Multi-timeframe signal:
+    Daily + H4 harus sama arah.
+    Return: signal string atau None
+    """
+    try:
+        # Daily signal
+        closes_d = get_closes(pair, 60, "D")
+        if len(closes_d) < 52: return None
+        ema20_d = calculate_ema(closes_d, settings["ema_fast"])
+        ema50_d = calculate_ema(closes_d, settings["ema_slow"])
+        c20_d, c50_d = ema20_d[-1], ema50_d[-1]
+        p20_d, p50_d = ema20_d[-2], ema50_d[-2]
+
+        if p20_d <= p50_d and c20_d > c50_d:   daily_sig = "buy"
+        elif p20_d >= p50_d and c20_d < c50_d:  daily_sig = "sell"
+        elif c20_d > c50_d:                      daily_sig = "buy_active"
+        elif c20_d < c50_d:                      daily_sig = "sell_active"
+        else:                                     return None
+
+        if not settings["mtf_enabled"]:
+            return daily_sig
+
+        # H4 confirmation
+        closes_h4 = get_closes(pair, 60, "H4")
+        if len(closes_h4) < 22: return daily_sig  # Kalau data H4 kurang, pakai daily saja
+        ema20_h4 = calculate_ema(closes_h4, settings["ema_fast"])
+        ema50_h4 = calculate_ema(closes_h4, settings["ema_slow"])
+        h4_bull  = ema20_h4[-1] > ema50_h4[-1]
+        h4_bear  = ema20_h4[-1] < ema50_h4[-1]
+
+        # Daily dan H4 harus searah
+        if daily_sig in ("buy", "buy_active") and h4_bull:   return daily_sig
+        if daily_sig in ("sell", "sell_active") and h4_bear:  return daily_sig
+
+        return None  # Tidak konfirmasi — skip entry
+    except Exception as e:
+        logger.error("[%s] MTF signal error: %s", pair, e)
+        return None
+
+def get_rsi_value(pair):
+    try:
+        closes = get_closes(pair, 50, "D")
+        if len(closes) < settings["rsi_period"] + 1: return 50
+        rsi = calculate_rsi(closes, settings["rsi_period"])
+        return round(rsi[-1], 1)
+    except Exception:
+        return 50
+
+
+# ══════════════════════════════════════════
+# CORRELATION CHECK
+# ══════════════════════════════════════════
+
+def is_correlation_blocked(pair):
+    """Cek apakah pair berkorelasi dengan pair yang sudah aktif."""
+    if not settings["correlation_filter"]: return False
+    for group in CORRELATION_GROUPS:
+        if pair not in group: continue
+        active_in_group = [p for p in group if p != pair and pair_active.get(p)]
+        if len(active_in_group) >= settings["max_corr_pairs"]:
+            return True, active_in_group[0]
+    return False, None
+
+
+# ══════════════════════════════════════════
+# PERFORMANCE CHECK
+# ══════════════════════════════════════════
+
+def check_pair_performance(pair):
+    """Cek apakah pair layak trading berdasarkan historis."""
+    if not settings["perf_tracking"]: return True
+    perf = pair_perf[pair]
+    if perf["trades"] < settings["perf_min_trades"]: return True  # Belum cukup data
+    winrate = perf["wins"] / perf["trades"] * 100
+    if winrate < settings["perf_min_winrate"]:
+        perf["disabled_by_perf"] = True
+        return False
+    perf["disabled_by_perf"] = False
+    return True
+
+
+# ══════════════════════════════════════════
+# TRADING HOURS & NEWS
 # ══════════════════════════════════════════
 
 def is_trading_time():
-    """Cek apakah sekarang waktu yang aman untuk entry."""
-    if not settings["trading_hours"]:
-        return True, "Trading hours dinonaktifkan"
-
-    now      = now_wib()
-    hour     = now.hour
-    weekday  = now.weekday()  # 0=Senin, 4=Jumat, 5=Sabtu, 6=Minggu
-
-    # Weekend
-    if weekday == 5 or weekday == 6:
-        return False, "Weekend — market tutup"
-
-    # Jumat sore
+    if not settings["trading_hours"]: return True, "OK"
+    now     = now_wib()
+    hour    = now.hour
+    weekday = now.weekday()
+    if weekday in (5, 6): return False, "Weekend"
     if weekday == 4 and settings["skip_friday"] and hour >= settings["skip_friday_hour"]:
-        return False, "Jumat malam — hindari gap weekend"
-
-    # Senin pagi
+        return False, "Jumat malam"
     if weekday == 0 and settings["skip_monday"] and hour < settings["skip_monday_hour"]:
-        return False, "Senin pagi — tunggu market stabil"
-
-    # Jam trading
-    h_start = settings["hour_start"]
-    h_end   = settings["hour_end"]
-    if not (h_start <= hour < h_end):
-        return False, "Di luar jam trading ({}:00-{}:00 WIB)".format(h_start, h_end)
-
+        return False, "Senin pagi"
+    if not (settings["hour_start"] <= hour < settings["hour_end"]):
+        return False, "Di luar jam {}:00-{}:00 WIB".format(settings["hour_start"], settings["hour_end"])
     return True, "OK"
 
-
-# ══════════════════════════════════════════
-# NEWS FILTER (Forex Factory RSS)
-# ══════════════════════════════════════════
-
 def fetch_news():
-    """Ambil high-impact news dari Forex Factory RSS."""
     global news_cache, news_cache_time
     try:
-        # Refresh tiap 1 jam
         if news_cache_time and (datetime.now() - news_cache_time).seconds < 3600:
             return news_cache
-
-        resp = req_lib.get(
-            "https://nfs.faireconomy.media/ff_calendar_thisweek.xml",
-            timeout=10
-        )
+        resp = req_lib.get("https://nfs.faireconomy.media/ff_calendar_thisweek.xml", timeout=10)
         root = ET.fromstring(resp.content)
         events = []
         for item in root.findall(".//event"):
             try:
-                impact = item.findtext("impact", "")
-                if impact.lower() != "high":
-                    continue
-                title   = item.findtext("title", "")
-                country = item.findtext("country", "")
-                date_s  = item.findtext("date", "")
-                time_s  = item.findtext("time", "")
-                if not date_s or not time_s:
-                    continue
-                dt_str = "{} {}".format(date_s, time_s)
-                try:
-                    dt = datetime.strptime(dt_str, "%m-%d-%Y %I:%M%p")
-                    # Convert dari EST ke WIB (+12 jam dari EST)
-                    dt_wib = dt.replace(tzinfo=pytz.timezone("US/Eastern")).astimezone(WIB)
-                    dt_wib = dt_wib.replace(tzinfo=None)
-                    events.append({"title": title, "country": country, "time": dt_wib})
-                except Exception:
-                    continue
-            except Exception:
-                continue
-
+                if item.findtext("impact", "").lower() != "high": continue
+                title  = item.findtext("title", "")
+                date_s = item.findtext("date", "")
+                time_s = item.findtext("time", "")
+                if not date_s or not time_s: continue
+                dt = datetime.strptime("{} {}".format(date_s, time_s), "%m-%d-%Y %I:%M%p")
+                dt_wib = dt.replace(tzinfo=pytz.timezone("US/Eastern")).astimezone(WIB).replace(tzinfo=None)
+                events.append({"title": title, "time": dt_wib})
+            except Exception: continue
         news_cache      = events
         news_cache_time = datetime.now()
-        logger.info("News cache updated: %d high-impact events", len(events))
         return events
     except Exception as e:
         logger.error("fetch_news: %s", e)
-        return news_cache  # Return cache lama kalau gagal
+        return news_cache
 
 def is_news_time():
-    """Cek apakah sekarang terlalu dekat dengan high-impact news."""
-    if not settings["news_filter"]:
-        return False, None
-
-    try:
-        events  = fetch_news()
-        now     = datetime.now()
-        before  = settings["news_pause_before"]
-        after   = settings["news_pause_after"]
-
-        for ev in events:
-            diff_min = (ev["time"] - now).total_seconds() / 60
-            if -after <= diff_min <= before:
-                return True, ev
-        return False, None
-    except Exception as e:
-        logger.error("is_news_time: %s", e)
-        return False, None
-
-def get_upcoming_news(max_events=5):
-    """Ambil news high-impact yang akan datang."""
+    if not settings["news_filter"]: return False, None
     try:
         events = fetch_news()
         now    = datetime.now()
-        upcoming = [e for e in events if (e["time"] - now).total_seconds() > 0]
-        upcoming.sort(key=lambda x: x["time"])
+        for ev in events:
+            diff_min = (ev["time"] - now).total_seconds() / 60
+            if -settings["news_pause_after"] <= diff_min <= settings["news_pause_before"]:
+                return True, ev
+        return False, None
+    except Exception:
+        return False, None
+
+def get_upcoming_news(max_events=5):
+    try:
+        events   = fetch_news()
+        now      = datetime.now()
+        upcoming = sorted([e for e in events if (e["time"] - now).total_seconds() > 0], key=lambda x: x["time"])
         return upcoming[:max_events]
     except Exception:
         return []
 
 
 # ══════════════════════════════════════════
-# OANDA
+# OANDA ORDERS
 # ══════════════════════════════════════════
-
-def get_candles(pair, count=60, granularity="D"):
-    import requests as _req
-    base = "https://api-fxpractice.oanda.com" if OANDA_ENV == "practice" else "https://api-fxtrade.oanda.com"
-    url  = "{}/v3/instruments/{}/candles".format(base, pair)
-    resp = _req.get(url,
-        headers={"Authorization": "Bearer " + OANDA_TOKEN, "Content-Type": "application/json"},
-        params={"count": str(count), "granularity": granularity, "price": "M"},
-        timeout=10)
-    resp.raise_for_status()
-    return resp.json()["candles"]
-
-def get_closes(pair, count=60):
-    candles = get_candles(pair, count)
-    return [float(c["mid"]["c"]) for c in candles if c["complete"]]
-
-def calculate_ema(data, period):
-    return pd.Series(data).ewm(span=period, adjust=False).mean().tolist()
-
-def calculate_adx(pair, period=14):
-    try:
-        candles   = get_candles(pair, count=period*3, granularity="D")
-        completed = [c for c in candles if c["complete"]]
-        if len(completed) < period + 1:
-            return 999
-        highs  = [float(c["mid"]["h"]) for c in completed]
-        lows   = [float(c["mid"]["l"]) for c in completed]
-        closes = [float(c["mid"]["c"]) for c in completed]
-        tr_list, pdm_list, ndm_list = [], [], []
-        for i in range(1, len(closes)):
-            h, l, pc = highs[i], lows[i], closes[i-1]
-            tr  = max(h - l, abs(h - pc), abs(l - pc))
-            pdm = max(h - highs[i-1], 0) if (h - highs[i-1]) > (lows[i-1] - l) else 0
-            ndm = max(lows[i-1] - l, 0)  if (lows[i-1] - l)  > (h - highs[i-1]) else 0
-            tr_list.append(tr); pdm_list.append(pdm); ndm_list.append(ndm)
-        def smooth(data, p):
-            result = [sum(data[:p])]
-            for i in range(p, len(data)):
-                result.append(result[-1] - result[-1]/p + data[i])
-            return result
-        atr  = smooth(tr_list, period)
-        pDI  = smooth(pdm_list, period)
-        nDI  = smooth(ndm_list, period)
-        dx_list = []
-        for i in range(len(atr)):
-            if atr[i] == 0: continue
-            pdi = 100 * pDI[i] / atr[i]
-            ndi = 100 * nDI[i] / atr[i]
-            dx  = 100 * abs(pdi - ndi) / (pdi + ndi) if (pdi + ndi) > 0 else 0
-            dx_list.append(dx)
-        if not dx_list: return 0
-        return round(sum(dx_list[-period:]) / period, 2)
-    except Exception as e:
-        logger.error("ADX [%s]: %s", pair, e)
-        return 999
-
-def get_ema_signal(pair):
-    closes = get_closes(pair, 60)
-    fast, slow = settings["ema_fast"], settings["ema_slow"]
-    if len(closes) < slow + 2: return None
-    ef = calculate_ema(closes, fast)
-    es = calculate_ema(closes, slow)
-    c_f, c_s = ef[-1], es[-1]
-    p_f, p_s = ef[-2], es[-2]
-    if p_f <= p_s and c_f > c_s:  return "buy"
-    if p_f >= p_s and c_f < c_s:  return "sell"
-    if c_f > c_s:                  return "buy_active"
-    if c_f < c_s:                  return "sell_active"
-    return None
 
 def get_open_trades(pair):
     r = trades.TradesList(ACCOUNT_ID, params={"instrument": pair, "state": "OPEN"})
@@ -355,46 +471,58 @@ def get_account_info():
     a = r.response["account"]
     nav    = float(a["NAV"])
     margin = float(a["marginUsed"])
-    margin_level = (nav / margin * 100) if margin > 0 else 9999
     return {
         "balance":      float(a["balance"]),
         "nav":          nav,
         "pl":           float(a["unrealizedPL"]),
         "margin":       margin,
         "free_margin":  float(a["marginAvailable"]),
-        "margin_level": round(margin_level, 1),
+        "margin_level": round(nav / margin * 100, 1) if margin > 0 else 9999,
     }
 
 def get_lot_size(balance=None):
-    """Hitung lot size dinamis berdasarkan balance."""
-    if not settings["dynamic_lot"]:
-        return settings["lot_size"]
-    if balance is None:
-        try:
-            info    = get_account_info()
-            balance = info["balance"]
-        except Exception:
-            return settings["lot_size"]
-    lot = round((balance / settings["dynamic_lot_per"]) * 0.01, 4)
+    if not settings["dynamic_lot"]: lot = settings["lot_size"]
+    else:
+        if balance is None:
+            try:    balance = get_account_info()["balance"]
+            except: return settings["lot_size"]
+        lot = round((balance / settings["dynamic_lot_per"]) * 0.01, 4)
+    # Kurangi lot 50% saat recovery mode
+    if recovery_mode and settings["drawdown_recovery"]:
+        lot = round(lot * 0.5, 4)
     return max(0.01, lot)
 
 def place_order(pair, direction, lot=None):
-    if lot is None:
-        lot = get_lot_size()
+    if lot is None: lot = get_lot_size()
     units = str(int(lot * 100000))
     if direction == "sell": units = "-" + units
     r = orders.OrderCreate(ACCOUNT_ID, data={"order": {"type": "MARKET", "instrument": pair, "units": units}})
     client.request(r)
-    logger.info("[%s] %s placed lot=%.4f", pair, direction.upper(), lot)
+    logger.info("[%s] %s lot=%.4f", pair, direction.upper(), lot)
     return lot
+
+def close_trade_partial(pair, open_trades, pct):
+    """Close sebagian posisi (pct = persentase 0-100)."""
+    closed_pl = 0.0
+    n_to_close = max(1, int(len(open_trades) * pct / 100))
+    sorted_trades = sorted(open_trades, key=lambda t: t["openTime"])
+    for trade in sorted_trades[:n_to_close]:
+        try:
+            units_to_close = abs(int(float(trade["currentUnits"]) * pct / 100))
+            units_to_close = max(1, units_to_close)
+            r = trades.TradeClose(ACCOUNT_ID, tradeID=trade["id"],
+                data={"units": str(units_to_close)})
+            client.request(r)
+            closed_pl += float(trade["unrealizedPL"]) * (pct / 100)
+        except Exception as e:
+            logger.error("[%s] partial close error: %s", pair, e)
+    return closed_pl
 
 def close_all_trades(pair, open_trades):
     total_pl = get_total_pl(open_trades)
     for trade in open_trades:
-        try:
-            client.request(trades.TradeClose(ACCOUNT_ID, tradeID=trade["id"]))
-        except Exception as e:
-            logger.error("[%s] close error: %s", pair, e)
+        try: client.request(trades.TradeClose(ACCOUNT_ID, tradeID=trade["id"]))
+        except Exception as e: logger.error("[%s] close error: %s", pair, e)
     return total_pl
 
 
@@ -406,131 +534,111 @@ async def monitor_daily_loss(app):
     global emergency_stop
     while True:
         try:
-            if emergency_stop or not any(pair_active.values()):
-                await asyncio.sleep(30)
-                continue
-            all_trades = get_all_open_trades()
-            total_pl   = sum(float(t["unrealizedPL"]) for t in all_trades)
-            if total_pl <= settings["daily_loss_limit"]:
-                emergency_stop = True
-                for pair in ALL_PAIRS: stop_pair(pair)
-                await app.bot.send_message(ALLOWED_USER_ID,
-                    "🚨 *EMERGENCY STOP\\!*\n\n"
-                    "Daily loss limit tercapai\\!\n"
-                    "Total floating: `{}`\n"
-                    "Limit: `{}`\n\nSemua pair dihentikan\\.".format(
-                        em("${:.2f}".format(total_pl)),
-                        em("${:.2f}".format(settings["daily_loss_limit"]))
-                    ), parse_mode="MarkdownV2")
-        except Exception as e:
-            logger.error("monitor_daily_loss: %s", e)
+            if not emergency_stop and any(pair_active.values()):
+                all_trades = get_all_open_trades()
+                total_pl   = sum(float(t["unrealizedPL"]) for t in all_trades)
+                if total_pl <= settings["daily_loss_limit"]:
+                    emergency_stop = True
+                    for p in ALL_PAIRS: stop_pair(p)
+                    await app.bot.send_message(ALLOWED_USER_ID,
+                        "EMERGENCY STOP! Daily loss limit ${} tercapai. Total floating: ${:.2f}".format(
+                            settings["daily_loss_limit"], total_pl))
+        except Exception as e: logger.error("monitor_daily_loss: %s", e)
         await asyncio.sleep(30)
 
-
 async def monitor_margin(app):
-    """Monitor margin level dan kirim warning kalau kritis."""
     global margin_warned
     while True:
         try:
-            if not any(pair_active.values()):
-                await asyncio.sleep(60)
-                continue
-            info          = get_account_info()
-            margin_level  = info["margin_level"]
-            warn_level    = settings["margin_warning"]
-            stop_level    = settings["margin_stop"]
-
-            if margin_level < stop_level:
-                # Stop semua entry baru
-                for pair in ALL_PAIRS: stop_pair(pair)
-                await app.bot.send_message(ALLOWED_USER_ID,
-                    "🚨 *MARGIN KRITIS\\!*\n\n"
-                    "Margin Level: `{}%`\n"
-                    "Stop Level: `{}%`\n\n"
-                    "Semua pair dihentikan untuk mencegah Margin Call\\!\n"
-                    "Free Margin: `{}`".format(
-                        em(str(margin_level)),
-                        em(str(stop_level)),
-                        em("${:.2f}".format(info["free_margin"]))
-                    ), parse_mode="MarkdownV2")
-                margin_warned = True
-
-            elif margin_level < warn_level and not margin_warned:
-                await app.bot.send_message(ALLOWED_USER_ID,
-                    "⚠️ *PERINGATAN MARGIN\\!*\n\n"
-                    "Margin Level: `{}%`\n"
-                    "Warning Level: `{}%`\n"
-                    "Free Margin: `{}`\n\n"
-                    "Pertimbangkan untuk mengurangi posisi\\.".format(
-                        em(str(margin_level)),
-                        em(str(warn_level)),
-                        em("${:.2f}".format(info["free_margin"]))
-                    ), parse_mode="MarkdownV2")
-                margin_warned = True
-
-            elif margin_level >= warn_level:
-                margin_warned = False  # Reset warning
-
-        except Exception as e:
-            logger.error("monitor_margin: %s", e)
+            if any(pair_active.values()):
+                info = get_account_info()
+                ml   = info["margin_level"]
+                if ml < settings["margin_stop"] and info["margin"] > 0:
+                    for p in ALL_PAIRS: stop_pair(p)
+                    await app.bot.send_message(ALLOWED_USER_ID,
+                        "MARGIN KRITIS {}%! Semua pair dihentikan.".format(ml))
+                    margin_warned = True
+                elif ml < settings["margin_warning"] and not margin_warned:
+                    await app.bot.send_message(ALLOWED_USER_ID,
+                        "WARNING: Margin Level {}%. Free margin: ${:.2f}".format(ml, info["free_margin"]))
+                    margin_warned = True
+                elif ml >= settings["margin_warning"]:
+                    margin_warned = False
+        except Exception as e: logger.error("monitor_margin: %s", e)
         await asyncio.sleep(60)
 
+async def monitor_drawdown(app):
+    """Monitor drawdown dan aktifkan recovery mode."""
+    global recovery_mode
+    while True:
+        try:
+            info    = get_account_info()
+            balance = info["balance"]
+            pl      = info["pl"]
+            # Update peak balance per pair
+            for p in ALL_PAIRS:
+                if pair_perf[p]["peak_balance"] < balance:
+                    pair_perf[p]["peak_balance"] = balance
+            # Cek drawdown global
+            if pl <= settings["drawdown_threshold"] and not recovery_mode:
+                recovery_mode = True
+                await app.bot.send_message(ALLOWED_USER_ID,
+                    "RECOVERY MODE aktif. Floating: ${:.2f}. Lot dikurangi 50%.".format(pl))
+            elif pl > 0 and recovery_mode:
+                recovery_mode = False
+                await app.bot.send_message(ALLOWED_USER_ID,
+                    "Recovery mode selesai. Lot normal kembali.")
+        except Exception as e: logger.error("monitor_drawdown: %s", e)
+        await asyncio.sleep(120)
+
+async def monitor_performance(app):
+    """Cek performance tiap pair dan nonaktifkan yang underperform."""
+    while True:
+        await asyncio.sleep(3600)  # Cek setiap jam
+        try:
+            if not settings["perf_tracking"]: continue
+            for pair in ALL_PAIRS:
+                perf = pair_perf[pair]
+                if perf["trades"] < settings["perf_min_trades"]: continue
+                winrate = perf["wins"] / perf["trades"] * 100
+                if winrate < settings["perf_min_winrate"] and pair_active.get(pair):
+                    stop_pair(pair)
+                    perf["disabled_by_perf"] = True
+                    await app.bot.send_message(ALLOWED_USER_ID,
+                        "{} dinonaktifkan. Win rate {:.0f}% < {}% (dari {} trade)".format(
+                            pair_label(pair), winrate, settings["perf_min_winrate"], perf["trades"]))
+        except Exception as e: logger.error("monitor_performance: %s", e)
 
 async def auto_summary(app):
     while True:
         interval = settings["notify_interval"]
         if interval <= 0:
-            await asyncio.sleep(60)
-            continue
+            await asyncio.sleep(60); continue
         await asyncio.sleep(interval)
         try:
             all_trades = get_all_open_trades()
             total_pl   = sum(float(t["unrealizedPL"]) for t in all_trades)
-            try:
-                info    = get_account_info()
-                balance = info["balance"]
-                margin_level = info["margin_level"]
-            except Exception:
-                balance      = 0.0
-                margin_level = 0.0
-
-            trading_ok, trading_reason = is_trading_time()
-            news_ok, news_ev = is_news_time()
-
-            status_lines = []
-            if not trading_ok:
-                status_lines.append("⏰ {}".format(em(trading_reason)))
-            if news_ok and news_ev:
-                status_lines.append("📰 News: {}".format(em(news_ev["title"])))
-
-            status_str = "\n".join(status_lines) if status_lines else "✅ Normal"
-
-            await app.bot.send_message(ALLOWED_USER_ID,
-                "⏰ *Ringkasan Otomatis*\n\n"
-                "🤖 Uptime: `{}`\n"
-                "💰 Balance: `{}`\n"
-                "📊 Floating P/L: `{}`\n"
-                "📋 Pair aktif: `{}/{}`\n"
-                "🔒 Margin Level: `{}%`\n"
-                "Status: {}\n\n"
-                "📈 Sesi ini:\n"
-                "  Trade: `{}` \\| Win: `{}` \\| Loss: `{}`\n"
-                "  P/L sesi: `{}`".format(
-                    em(uptime_str()),
-                    em("${:.2f}".format(balance)),
-                    em("${:.2f}".format(total_pl)),
-                    active_pair_count(), len(ALL_PAIRS),
-                    em(str(margin_level)),
-                    status_str,
-                    daily_stats["trades"], daily_stats["wins"], daily_stats["losses"],
-                    em("${:.2f}".format(daily_stats["total_pl"]))
-                ), parse_mode="MarkdownV2")
-        except Exception as e:
-            logger.error("auto_summary: %s", e)
+            info       = get_account_info()
+            wr = "{:.0f}%".format(daily_stats["wins"]/daily_stats["trades"]*100) if daily_stats["trades"] > 0 else "N/A"
+            msg = (
+                "RINGKASAN OTOMATIS\n\n"
+                "Uptime: {}\nBalance: ${:.2f}\nFloating: ${:.2f}\n"
+                "Margin Level: {}%\nPair aktif: {}/{}\n"
+                "Recovery mode: {}\n\n"
+                "Sesi ini:\nTrade: {} | Win: {} | Loss: {}\nWin Rate: {} | P/L: ${:.2f}"
+            ).format(
+                uptime_str(), info["balance"], total_pl,
+                info["margin_level"], active_pair_count(), len(ALL_PAIRS),
+                "ON" if recovery_mode else "OFF",
+                daily_stats["trades"], daily_stats["wins"], daily_stats["losses"],
+                wr, daily_stats["total_pl"]
+            )
+            await app.bot.send_message(ALLOWED_USER_ID, msg)
+        except Exception as e: logger.error("auto_summary: %s", e)
 
 
 # ══════════════════════════════════════════
-# TRADING LOOP PER PAIR
+# TRADING LOOP
 # ══════════════════════════════════════════
 
 async def trading_loop_pair(pair, app):
@@ -540,10 +648,8 @@ async def trading_loop_pair(pair, app):
 
     while pair_active.get(pair, False):
         if emergency_stop:
-            await asyncio.sleep(60)
-            continue
+            await asyncio.sleep(60); continue
         try:
-            signal        = get_ema_signal(pair)
             open_trades   = get_open_trades(pair)
             n_buy, n_sell = count_buy_sell(open_trades)
             total_pl      = get_total_pl(open_trades)
@@ -554,138 +660,196 @@ async def trading_loop_pair(pair, app):
             if open_trades and total_pl > state["peak_profit"]:
                 state["peak_profit"] = total_pl
 
-            # ── 1. Hard SL ──
-            if open_trades and total_pl <= settings["hard_sl"]:
-                pl_closed = close_all_trades(pair, open_trades)
-                log_trade(pair, "all", "hard_sl", pl_closed)
-                state.update({"last_signal": None, "waiting_cross": None, "peak_profit": 0.0})
+            # ── 1. Hard SL (atau ATR SL) ──
+            sl_limit = state["atr_sl"] if settings["atr_sl_tp"] and state["atr_sl"] else settings["hard_sl"]
+            if open_trades and total_pl <= sl_limit:
+                pl_c = close_all_trades(pair, open_trades)
+                log_trade(pair, "all", "hard_sl", pl_c)
+                state.update({"last_signal": None, "waiting_cross": None, "peak_profit": 0.0,
+                               "partial_done": False, "breakeven_done": False,
+                               "entry_price": None, "atr_sl": None, "atr_tp": None})
                 await app.bot.send_message(ALLOWED_USER_ID,
-                    "🛑 *{}* \u2014 HARD SL\\!\n"
-                    "Floating: `{}` \\| Limit: `{}`\n"
-                    "`{}` posisi ditutup\\.".format(
-                        lbl, pl_s, em("${:.2f}".format(settings["hard_sl"])), len(open_trades)
-                    ), parse_mode="MarkdownV2")
-                await asyncio.sleep(settings["check_interval"])
-                continue
+                    "HARD SL {} | Floating: {} | Limit: {}".format(
+                        pair_label(pair), pl_s, em("${:.2f}".format(sl_limit))))
+                await asyncio.sleep(settings["check_interval"]); continue
 
-            # ── 2. Trailing TP ──
-            if settings["trailing_tp"] and open_trades and state["peak_profit"] >= settings["total_tp"]:
+            # ── 2. Partial Close ──
+            if settings["partial_close"] and open_trades and not state["partial_done"]:
+                if total_pl >= settings["partial_tp"]:
+                    pl_c = close_trade_partial(pair, open_trades, settings["partial_pct"])
+                    state["partial_done"] = True
+                    log_trade(pair, "partial", "partial_close", pl_c)
+                    await app.bot.send_message(ALLOWED_USER_ID,
+                        "PARTIAL CLOSE {} | {}% posisi ditutup | Profit: {}".format(
+                            pair_label(pair), settings["partial_pct"], pl_s))
+                    open_trades = get_open_trades(pair)  # Refresh
+
+            # ── 3. Trailing TP (atau ATR TP) ──
+            tp_target = state["atr_tp"] if settings["atr_sl_tp"] and state["atr_tp"] else settings["total_tp"]
+            if settings["trailing_tp"] and open_trades and state["peak_profit"] >= tp_target:
                 if state["peak_profit"] - total_pl >= settings["trailing_pullback"]:
-                    pl_closed = close_all_trades(pair, open_trades)
-                    log_trade(pair, "all", "trailing_tp", pl_closed)
-                    state.update({"last_signal": None, "waiting_cross": None, "peak_profit": 0.0})
+                    pl_c = close_all_trades(pair, open_trades)
+                    log_trade(pair, "all", "trailing_tp", pl_c)
+                    state.update({"last_signal": None, "waiting_cross": None, "peak_profit": 0.0,
+                                   "partial_done": False, "breakeven_done": False,
+                                   "entry_price": None, "atr_sl": None, "atr_tp": None})
                     await app.bot.send_message(ALLOWED_USER_ID,
-                        "📍 *{}* \u2014 TRAILING TP\\!\n"
-                        "Peak: `{}` \u2192 Close: `{}`".format(
-                            lbl,
-                            em("${:.2f}".format(state["peak_profit"])), pl_s
-                        ), parse_mode="MarkdownV2")
-                    await asyncio.sleep(settings["check_interval"])
-                    continue
+                        "TRAILING TP {} | Peak: {} | Close: {}".format(
+                            pair_label(pair), em("${:.2f}".format(state["peak_profit"])), pl_s))
+                    await asyncio.sleep(settings["check_interval"]); continue
 
-            # ── 3. Normal TP ──
-            if open_trades and total_pl >= settings["total_tp"] and not settings["trailing_tp"]:
-                pl_closed = close_all_trades(pair, open_trades)
-                log_trade(pair, "all", "tp", pl_closed)
-                state.update({"last_signal": None, "waiting_cross": None, "peak_profit": 0.0})
+            # ── 4. Normal TP ──
+            if open_trades and total_pl >= tp_target and not settings["trailing_tp"]:
+                pl_c = close_all_trades(pair, open_trades)
+                log_trade(pair, "all", "tp", pl_c)
+                state.update({"last_signal": None, "waiting_cross": None, "peak_profit": 0.0,
+                               "partial_done": False, "breakeven_done": False,
+                               "entry_price": None, "atr_sl": None, "atr_tp": None})
                 await app.bot.send_message(ALLOWED_USER_ID,
-                    "🎯 *{}* \u2014 TP\\!\nProfit: `{}` \\| `{}` posisi".format(
-                        lbl, pl_s, len(open_trades)
-                    ), parse_mode="MarkdownV2")
-                await asyncio.sleep(settings["check_interval"])
-                continue
+                    "TP {} | Profit: {}".format(pair_label(pair), pl_s))
+                await asyncio.sleep(settings["check_interval"]); continue
 
-            # ── 4. Crossing berlawanan ──
+            # ── 5. Crossing berlawanan ──
             if open_trades:
+                signal = get_ema_signal_mtf(pair)
                 if n_buy > 0 and signal in ("sell", "sell_active"):
-                    pl_closed = close_all_trades(pair, open_trades)
-                    log_trade(pair, "buy", "cross_close", pl_closed)
-                    state.update({"last_signal": None, "waiting_cross": "sell", "peak_profit": 0.0})
+                    pl_c = close_all_trades(pair, open_trades)
+                    log_trade(pair, "buy", "cross_close", pl_c)
+                    state.update({"last_signal": None, "waiting_cross": "sell", "peak_profit": 0.0,
+                                   "partial_done": False, "breakeven_done": False,
+                                   "entry_price": None, "atr_sl": None, "atr_tp": None})
                     await app.bot.send_message(ALLOWED_USER_ID,
-                        "🔄 *{}* \u2014 Death Cross\\!\nBUY ditutup\\. P/L: `{}`".format(lbl, pl_s),
-                        parse_mode="MarkdownV2")
-                    await asyncio.sleep(settings["check_interval"])
-                    continue
+                        "DEATH CROSS {} | BUY ditutup | P/L: {}".format(pair_label(pair), pl_s))
+                    await asyncio.sleep(settings["check_interval"]); continue
                 if n_sell > 0 and signal in ("buy", "buy_active"):
-                    pl_closed = close_all_trades(pair, open_trades)
-                    log_trade(pair, "sell", "cross_close", pl_closed)
-                    state.update({"last_signal": None, "waiting_cross": "buy", "peak_profit": 0.0})
+                    pl_c = close_all_trades(pair, open_trades)
+                    log_trade(pair, "sell", "cross_close", pl_c)
+                    state.update({"last_signal": None, "waiting_cross": "buy", "peak_profit": 0.0,
+                                   "partial_done": False, "breakeven_done": False,
+                                   "entry_price": None, "atr_sl": None, "atr_tp": None})
                     await app.bot.send_message(ALLOWED_USER_ID,
-                        "🔄 *{}* \u2014 Golden Cross\\!\nSELL ditutup\\. P/L: `{}`".format(lbl, pl_s),
-                        parse_mode="MarkdownV2")
-                    await asyncio.sleep(settings["check_interval"])
-                    continue
+                        "GOLDEN CROSS {} | SELL ditutup | P/L: {}".format(pair_label(pair), pl_s))
+                    await asyncio.sleep(settings["check_interval"]); continue
 
-            # ── 5. Cek kondisi untuk entry baru ──
+            # ── 6. Entry baru ──
+            signal = get_ema_signal_mtf(pair)
             can_buy  = signal == "buy"  and state["last_signal"] != "buy"  and n_buy  == 0 and state["waiting_cross"] != "sell"
             can_sell = signal == "sell" and state["last_signal"] != "sell" and n_sell == 0 and state["waiting_cross"] != "buy"
 
             if can_buy or can_sell:
-                # ── Cek trading hours ──
+                # Trading hours
                 trading_ok, trading_reason = is_trading_time()
                 if not trading_ok:
-                    logger.info("[%s] Skip entry: %s", pair, trading_reason)
-                    await asyncio.sleep(settings["check_interval"])
-                    continue
+                    await asyncio.sleep(settings["check_interval"]); continue
 
-                # ── Cek news filter ──
-                news_pause, news_ev = is_news_time()
-                if news_pause and news_ev:
-                    logger.info("[%s] Skip entry: news %s", pair, news_ev["title"])
-                    await asyncio.sleep(settings["check_interval"])
-                    continue
+                # News filter
+                news_pause, _ = is_news_time()
+                if news_pause:
+                    await asyncio.sleep(settings["check_interval"]); continue
 
-                # ── Cek margin ──
+                # Performance check
+                if not check_pair_performance(pair):
+                    logger.info("[%s] Disabled by performance.", pair)
+                    stop_pair(pair); break
+
+                # Correlation filter
+                corr_blocked, corr_pair = is_correlation_blocked(pair)
+                if corr_blocked:
+                    logger.info("[%s] Blocked by correlation with %s.", pair, corr_pair)
+                    await asyncio.sleep(settings["check_interval"]); continue
+
+                # Margin check
                 try:
                     info = get_account_info()
                     if info["margin_level"] < settings["margin_stop"] and info["margin"] > 0:
-                        logger.warning("[%s] Skip entry: margin level %.1f%%", pair, info["margin_level"])
-                        await asyncio.sleep(settings["check_interval"])
-                        continue
+                        await asyncio.sleep(settings["check_interval"]); continue
                     lot = get_lot_size(info["balance"])
                 except Exception:
                     lot = settings["lot_size"]
 
-                # ── Cek ADX ──
-                adx_val = 0
+                # OHLC data untuk indikator
+                try:
+                    ohlc = get_ohlc(pair, 60, "D")
+                except Exception as e:
+                    logger.error("[%s] OHLC error: %s", pair, e)
+                    await asyncio.sleep(settings["check_interval"]); continue
+
+                # ADX filter
                 if settings["adx_filter"]:
-                    adx_val = calculate_adx(pair)
+                    adx_val = calculate_adx(ohlc)
                     if adx_val < settings["adx_min"]:
-                        logger.info("[%s] Skip entry: ADX %.1f < %d", pair, adx_val, settings["adx_min"])
-                        await asyncio.sleep(settings["check_interval"])
-                        continue
-
-                adx_str = " \\| ADX: `{}`".format(em(str(adx_val))) if settings["adx_filter"] else ""
-                lot_str = em(str(round(lot, 4)))
-
-                if can_buy:
-                    place_order(pair, "buy", lot)
-                    log_trade(pair, "buy", "entry_1")
-                    state.update({"last_signal": "buy", "waiting_cross": None, "peak_profit": 0.0})
-                    await app.bot.send_message(ALLOWED_USER_ID,
-                        "📈 *{}* \u2014 ENTRY BUY \\#1\n"
-                        "EMA{}/{}{} \\| Lot: `{}`".format(
-                            lbl, settings["ema_fast"], settings["ema_slow"], adx_str, lot_str
-                        ), parse_mode="MarkdownV2")
+                        await asyncio.sleep(settings["check_interval"]); continue
                 else:
-                    place_order(pair, "sell", lot)
-                    log_trade(pair, "sell", "entry_1")
-                    state.update({"last_signal": "sell", "waiting_cross": None, "peak_profit": 0.0})
-                    await app.bot.send_message(ALLOWED_USER_ID,
-                        "📉 *{}* \u2014 ENTRY SELL \\#1\n"
-                        "EMA{}/{}{} \\| Lot: `{}`".format(
-                            lbl, settings["ema_fast"], settings["ema_slow"], adx_str, lot_str
-                        ), parse_mode="MarkdownV2")
+                    adx_val = 0
 
-            # ── 6. Layering ──
+                # RSI filter
+                rsi_val = 50
+                if settings["rsi_filter"]:
+                    rsi_val = calculate_rsi(ohlc["closes"], settings["rsi_period"])[-1]
+                    rsi_val = round(rsi_val, 1)
+                    if can_buy  and rsi_val < settings["rsi_buy_min"]:
+                        await asyncio.sleep(settings["check_interval"]); continue
+                    if can_sell and rsi_val > settings["rsi_sell_max"]:
+                        await asyncio.sleep(settings["check_interval"]); continue
+
+                # ATR untuk dynamic SL/TP
+                atr = calculate_atr(ohlc, settings["atr_period"])
+                pip_value = 10 * lot  # Estimasi pip value
+                if settings["atr_sl_tp"] and atr > 0:
+                    atr_sl_dollar = round(atr * settings["atr_sl_mult"] * 10000 * lot * 10, 2)
+                    atr_tp_dollar = round(atr * settings["atr_tp_mult"] * 10000 * lot * 10, 2)
+                    state["atr_sl"] = -abs(atr_sl_dollar)
+                    state["atr_tp"] = abs(atr_tp_dollar)
+                else:
+                    state["atr_sl"] = None
+                    state["atr_tp"] = None
+
+                # Place order
+                direction = "buy" if can_buy else "sell"
+                place_order(pair, direction, lot)
+                log_trade(pair, direction, "entry_1")
+                state["last_signal"]    = direction
+                state["waiting_cross"]  = None
+                state["peak_profit"]    = 0.0
+                state["partial_done"]   = False
+                state["breakeven_done"] = False
+                state["entry_price"]    = ohlc["closes"][-1]
+
+                sl_info = em("${:.2f}".format(state["atr_sl"])) if state["atr_sl"] else em(str(settings["hard_sl"]))
+                tp_info = em("${:.2f}".format(state["atr_tp"])) if state["atr_tp"] else em(str(settings["total_tp"]))
+                icon    = "BUY" if can_buy else "SELL"
+                await app.bot.send_message(ALLOWED_USER_ID,
+                    "ENTRY {} {} | EMA{}/{} | ADX:{} RSI:{}\nLot:{} | SL:{} TP:{}".format(
+                        icon, pair_label(pair),
+                        settings["ema_fast"], settings["ema_slow"],
+                        adx_val, rsi_val,
+                        lot, sl_info, tp_info))
+
+            # ── 7. Layering ──
             elif open_trades:
                 last_pl      = get_last_trade_pl(open_trades)
                 total_layers = n_buy + n_sell
-                if last_pl is not None and last_pl <= settings["layer_trigger"]:
+
+                # Fibonacci layering
+                layer_trigger = settings["layer_trigger"]
+                if settings["fib_layers"] and state["entry_price"]:
+                    fibs = get_swing_fib_levels(pair)
+                    if fibs:
+                        closes = get_ohlc(pair, 5, "D")["closes"]
+                        curr_price = closes[-1] if closes else state["entry_price"]
+                        # Layer di level Fibonacci
+                        fib_trigger = any([
+                            abs(curr_price - fibs["fib382"]) < 0.0010,
+                            abs(curr_price - fibs["fib500"]) < 0.0010,
+                            abs(curr_price - fibs["fib618"]) < 0.0010,
+                        ])
+                        if not fib_trigger and last_pl and last_pl > layer_trigger:
+                            await asyncio.sleep(settings["check_interval"]); continue
+
+                if last_pl is not None and last_pl <= layer_trigger:
                     if total_layers >= settings["max_layers"]:
-                        logger.warning("[%s] Max layers reached.", pair)
+                        pass  # Max layer reached
                     else:
-                        # Cek trading hours dan news untuk layering juga
                         trading_ok, _ = is_trading_time()
                         news_pause, _ = is_news_time()
                         if trading_ok and not news_pause:
@@ -697,46 +861,35 @@ async def trading_loop_pair(pair, app):
                             except Exception:
                                 lot = settings["lot_size"]
 
-                            if lot is not None:
-                                ls  = em("${:.2f}".format(last_pl))
+                            if lot:
+                                signal = get_ema_signal_mtf(pair)
+                                ls     = em("${:.2f}".format(last_pl))
                                 if n_buy > 0 and signal in ("buy", "buy_active"):
                                     place_order(pair, "buy", lot)
                                     log_trade(pair, "buy", "layer_{}".format(n_buy+1))
                                     await app.bot.send_message(ALLOWED_USER_ID,
-                                        "📈 *{}* \u2014 LAYER BUY \\#{}\n"
-                                        "Last: `{}` \\| Total: `{}` \\| Layer: `{}/{}`".format(
-                                            lbl, n_buy+1, ls, pl_s, n_buy+1, settings["max_layers"]
-                                        ), parse_mode="MarkdownV2")
+                                        "LAYER BUY #{} {} | Last:{} Total:{} | {}/{}".format(
+                                            n_buy+1, pair_label(pair), ls, pl_s, n_buy+1, settings["max_layers"]))
                                 elif n_sell > 0 and signal in ("sell", "sell_active"):
                                     place_order(pair, "sell", lot)
                                     log_trade(pair, "sell", "layer_{}".format(n_sell+1))
                                     await app.bot.send_message(ALLOWED_USER_ID,
-                                        "📉 *{}* \u2014 LAYER SELL \\#{}\n"
-                                        "Last: `{}` \\| Total: `{}` \\| Layer: `{}/{}`".format(
-                                            lbl, n_sell+1, ls, pl_s, n_sell+1, settings["max_layers"]
-                                        ), parse_mode="MarkdownV2")
+                                        "LAYER SELL #{} {} | Last:{} Total:{} | {}/{}".format(
+                                            n_sell+1, pair_label(pair), ls, pl_s, n_sell+1, settings["max_layers"]))
 
         except Exception as e:
             err_str = str(e)
             logger.error("[%s] %s", pair, e)
-            # Pair tidak tersedia — nonaktifkan permanen
-            if "Insufficient authorization" in err_str or "No instrument" in err_str:
+            if "Insufficient authorization" in err_str:
                 unavailable_pairs.add(pair)
                 stop_pair(pair)
-                try:
-                    await app.bot.send_message(ALLOWED_USER_ID,
-                        "Pair {} tidak tersedia di akun ini, dinonaktifkan otomatis.".format(
-                            pair_label(pair)))
-                except Exception:
-                    pass
-                return  # Keluar dari loop pair ini selamanya
-            # Error lain — kirim notif tapi tetap jalan
+                await app.bot.send_message(ALLOWED_USER_ID,
+                    "{} dinonaktifkan - pair tidak tersedia di akun ini.".format(pair_label(pair)))
+                return
             try:
                 await app.bot.send_message(ALLOWED_USER_ID,
-                    "⚠️ *{}* error: `{}`".format(em(pair_label(pair)), em(str(e))),
-                    parse_mode="MarkdownV2")
-            except Exception:
-                pass
+                    "Error {}: {}".format(pair_label(pair), str(e)[:100]))
+            except Exception: pass
 
         await asyncio.sleep(settings["check_interval"])
     logger.info("[%s] Loop stop.", pair)
@@ -745,9 +898,12 @@ async def trading_loop_pair(pair, app):
 def start_pair(pair, app):
     if pair_active.get(pair): return False
     if pair in unavailable_pairs: return "unavailable"
+    if pair_perf[pair].get("disabled_by_perf"): return "perf"
     if active_pair_count() >= settings["max_active_pairs"]: return "max"
     pair_active[pair] = True
-    pair_state[pair]  = {"last_signal": None, "waiting_cross": None, "peak_profit": 0.0}
+    pair_state[pair]  = {"last_signal": None, "waiting_cross": None, "peak_profit": 0.0,
+                          "partial_done": False, "breakeven_done": False,
+                          "entry_price": None, "atr_sl": None, "atr_tp": None}
     pair_tasks[pair]  = asyncio.create_task(trading_loop_pair(pair, app))
     return True
 
@@ -765,19 +921,22 @@ def stop_pair(pair):
 # ══════════════════════════════════════════
 
 def kb_main():
-    estop_label = "🔓 Reset Emergency Stop" if emergency_stop else "🚨 Emergency Stop"
+    estop = "Reset Emergency Stop" if emergency_stop else "EMERGENCY STOP"
+    rec   = " | RECOVERY MODE" if recovery_mode else ""
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 Pair ({}/{})".format(active_pair_count(), settings["max_active_pairs"]), callback_data="menu_pairs")],
-        [InlineKeyboardButton("⚙️ Setting",       callback_data="menu_settings"),
-         InlineKeyboardButton("📊 Akun",          callback_data="menu_account")],
-        [InlineKeyboardButton("📈 Posisi",        callback_data="menu_positions"),
-         InlineKeyboardButton("📜 Log",           callback_data="menu_log")],
-        [InlineKeyboardButton("📰 News",          callback_data="menu_news"),
-         InlineKeyboardButton("⏰ Jam Trading",   callback_data="menu_hours")],
-        [InlineKeyboardButton("▶️ ON Semua",      callback_data="all_on"),
-         InlineKeyboardButton("⏹ OFF Semua",     callback_data="all_off")],
-        [InlineKeyboardButton("❌ Close Semua",   callback_data="confirm_closeall")],
-        [InlineKeyboardButton(estop_label,        callback_data="toggle_estop")],
+        [InlineKeyboardButton("Pair ({}/{}){}".format(active_pair_count(), settings["max_active_pairs"], rec), callback_data="menu_pairs")],
+        [InlineKeyboardButton("Setting", callback_data="menu_settings"),
+         InlineKeyboardButton("Akun",    callback_data="menu_account")],
+        [InlineKeyboardButton("Posisi",  callback_data="menu_positions"),
+         InlineKeyboardButton("Log",     callback_data="menu_log")],
+        [InlineKeyboardButton("News",    callback_data="menu_news"),
+         InlineKeyboardButton("Jam Trading", callback_data="menu_hours")],
+        [InlineKeyboardButton("Performance", callback_data="menu_perf"),
+         InlineKeyboardButton("Korelasi",    callback_data="menu_corr")],
+        [InlineKeyboardButton("ON Semua",    callback_data="all_on"),
+         InlineKeyboardButton("OFF Semua",   callback_data="all_off")],
+        [InlineKeyboardButton("Close Semua Posisi", callback_data="confirm_closeall")],
+        [InlineKeyboardButton(estop, callback_data="toggle_estop")],
     ])
 
 def kb_pairs(page=0):
@@ -787,81 +946,85 @@ def kb_pairs(page=0):
     total_pages = (len(ALL_PAIRS) + per_page - 1) // per_page
     rows = []
     for pair in page_pairs:
-        if pair in unavailable_pairs:
-            icon = "🚫"
-        elif pair_active.get(pair):
-            icon = "✅"
-        else:
-            icon = "⭕"
+        if pair in unavailable_pairs:                icon = "🚫"
+        elif pair_perf[pair].get("disabled_by_perf"): icon = "📉"
+        elif pair_active.get(pair):                  icon = "✅"
+        else:                                         icon = "⭕"
         rows.append([InlineKeyboardButton("{} {}".format(icon, pair_label(pair)), callback_data="toggle_" + pair)])
     nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("◀️", callback_data="pairs_page_{}".format(page-1)))
+    if page > 0: nav.append(InlineKeyboardButton("Prev", callback_data="pairs_page_{}".format(page-1)))
     nav.append(InlineKeyboardButton("{}/{}".format(page+1, total_pages), callback_data="noop"))
-    if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("▶️", callback_data="pairs_page_{}".format(page+1)))
+    if page < total_pages - 1: nav.append(InlineKeyboardButton("Next", callback_data="pairs_page_{}".format(page+1)))
     rows.append(nav)
-    rows.append([InlineKeyboardButton("🏠 Menu", callback_data="menu_main")])
+    rows.append([InlineKeyboardButton("Menu", callback_data="menu_main")])
     return InlineKeyboardMarkup(rows)
 
 def kb_settings():
-    s   = settings
-    adx = "ON ✅" if s["adx_filter"] else "OFF ⭕"
-    ttp = "ON ✅" if s["trailing_tp"] else "OFF ⭕"
-    th  = "ON ✅" if s["trading_hours"] else "OFF ⭕"
-    nf  = "ON ✅" if s["news_filter"] else "OFF ⭕"
-    dl  = "ON ✅" if s["dynamic_lot"] else "OFF ⭕"
-    sf  = "ON ✅" if s["skip_friday"] else "OFF ⭕"
-    sm  = "ON ✅" if s["skip_monday"] else "OFF ⭕"
-    notif = "{}s".format(s["notify_interval"]) if s["notify_interval"] > 0 else "Off"
+    s = settings
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("── Entry ──", callback_data="noop")],
-        [InlineKeyboardButton("📦 Lot: {}  💡 Dynamic: {}".format(s["lot_size"], dl), callback_data="set_lot_size")],
-        [InlineKeyboardButton("💡 Toggle Dynamic Lot", callback_data="toggle_dynamic_lot")],
-        [InlineKeyboardButton("💡 Per $: {}".format(s["dynamic_lot_per"]), callback_data="set_dynamic_lot_per")],
-        [InlineKeyboardButton("📊 EMA Fast: {}".format(s["ema_fast"]), callback_data="set_ema_fast"),
-         InlineKeyboardButton("📊 EMA Slow: {}".format(s["ema_slow"]), callback_data="set_ema_slow")],
-        [InlineKeyboardButton("── Layering ──", callback_data="noop")],
-        [InlineKeyboardButton("📉 Layer Trigger: ${}".format(s["layer_trigger"]), callback_data="set_layer_trigger")],
-        [InlineKeyboardButton("🔢 Max Layers: {}".format(s["max_layers"]), callback_data="set_max_layers")],
-        [InlineKeyboardButton("── Exit ──", callback_data="noop")],
-        [InlineKeyboardButton("🎯 TP: ${}".format(s["total_tp"]), callback_data="set_total_tp"),
-         InlineKeyboardButton("🛑 Hard SL: ${}".format(s["hard_sl"]), callback_data="set_hard_sl")],
-        [InlineKeyboardButton("📍 Trailing TP: {}".format(ttp), callback_data="toggle_trailing_tp")],
-        [InlineKeyboardButton("📍 Pullback: ${}".format(s["trailing_pullback"]), callback_data="set_trailing_pullback")],
-        [InlineKeyboardButton("── Filter ──", callback_data="noop")],
-        [InlineKeyboardButton("📡 ADX: {}  Min: {}".format(adx, s["adx_min"]), callback_data="set_adx_min")],
-        [InlineKeyboardButton("📡 Toggle ADX Filter", callback_data="toggle_adx_filter")],
-        [InlineKeyboardButton("── Trading Hours ──", callback_data="noop")],
-        [InlineKeyboardButton("⏰ Hours: {}  {}-{}WIB".format(th, s["hour_start"], s["hour_end"]), callback_data="toggle_trading_hours")],
-        [InlineKeyboardButton("⏰ Jam Start: {}".format(s["hour_start"]), callback_data="set_hour_start"),
-         InlineKeyboardButton("⏰ Jam End: {}".format(s["hour_end"]), callback_data="set_hour_end")],
-        [InlineKeyboardButton("📅 Skip Jumat: {}  h>{}".format(sf, s["skip_friday_hour"]), callback_data="toggle_skip_friday")],
-        [InlineKeyboardButton("📅 Skip Senin: {}  h<{}".format(sm, s["skip_monday_hour"]), callback_data="toggle_skip_monday")],
-        [InlineKeyboardButton("── News Filter ──", callback_data="noop")],
-        [InlineKeyboardButton("📰 News Filter: {}".format(nf), callback_data="toggle_news_filter")],
-        [InlineKeyboardButton("📰 Sebelum: {}m".format(s["news_pause_before"]), callback_data="set_news_pause_before"),
-         InlineKeyboardButton("📰 Setelah: {}m".format(s["news_pause_after"]), callback_data="set_news_pause_after")],
-        [InlineKeyboardButton("── Margin ──", callback_data="noop")],
-        [InlineKeyboardButton("⚠️ Warn: {}%".format(s["margin_warning"]), callback_data="set_margin_warning"),
-         InlineKeyboardButton("🛑 Stop: {}%".format(s["margin_stop"]), callback_data="set_margin_stop")],
-        [InlineKeyboardButton("── Risk Global ──", callback_data="noop")],
-        [InlineKeyboardButton("👥 Max Pair: {}".format(s["max_active_pairs"]), callback_data="set_max_active_pairs"),
-         InlineKeyboardButton("🔴 Daily Limit: ${}".format(s["daily_loss_limit"]), callback_data="set_daily_loss_limit")],
-        [InlineKeyboardButton("── Bot ──", callback_data="noop")],
-        [InlineKeyboardButton("⏱ Interval: {}s".format(s["check_interval"]), callback_data="set_check_interval"),
-         InlineKeyboardButton("🔔 Summary: {}".format(notif), callback_data="set_notify_interval")],
-        [InlineKeyboardButton("🏠 Menu Utama", callback_data="menu_main")],
+        [InlineKeyboardButton("── ENTRY ──", callback_data="noop")],
+        [InlineKeyboardButton("Lot: {} | Dynamic: {}".format(s["lot_size"], "ON" if s["dynamic_lot"] else "OFF"), callback_data="set_lot_size")],
+        [InlineKeyboardButton("Toggle Dynamic Lot", callback_data="toggle_dynamic_lot")],
+        [InlineKeyboardButton("Per $: {}".format(s["dynamic_lot_per"]), callback_data="set_dynamic_lot_per")],
+        [InlineKeyboardButton("EMA Fast: {}".format(s["ema_fast"]), callback_data="set_ema_fast"),
+         InlineKeyboardButton("EMA Slow: {}".format(s["ema_slow"]), callback_data="set_ema_slow")],
+        [InlineKeyboardButton("── FILTER ──", callback_data="noop")],
+        [InlineKeyboardButton("Multi-TF H4: {}".format("ON" if s["mtf_enabled"] else "OFF"), callback_data="toggle_mtf_enabled")],
+        [InlineKeyboardButton("RSI Filter: {} Min:{}".format("ON" if s["rsi_filter"] else "OFF", s["rsi_buy_min"]), callback_data="set_rsi_buy_min")],
+        [InlineKeyboardButton("Toggle RSI Filter", callback_data="toggle_rsi_filter")],
+        [InlineKeyboardButton("ADX Filter: {} Min:{}".format("ON" if s["adx_filter"] else "OFF", s["adx_min"]), callback_data="set_adx_min")],
+        [InlineKeyboardButton("Toggle ADX Filter", callback_data="toggle_adx_filter")],
+        [InlineKeyboardButton("Correlation Filter: {}".format("ON" if s["correlation_filter"] else "OFF"), callback_data="toggle_correlation_filter")],
+        [InlineKeyboardButton("── LAYERING ──", callback_data="noop")],
+        [InlineKeyboardButton("Layer Trigger: ${}".format(s["layer_trigger"]), callback_data="set_layer_trigger")],
+        [InlineKeyboardButton("Max Layers: {}".format(s["max_layers"]), callback_data="set_max_layers")],
+        [InlineKeyboardButton("Fibonacci Layers: {}".format("ON" if s["fib_layers"] else "OFF"), callback_data="toggle_fib_layers")],
+        [InlineKeyboardButton("── EXIT ──", callback_data="noop")],
+        [InlineKeyboardButton("TP: ${}".format(s["total_tp"]), callback_data="set_total_tp"),
+         InlineKeyboardButton("Hard SL: ${}".format(s["hard_sl"]), callback_data="set_hard_sl")],
+        [InlineKeyboardButton("Trailing TP: {}".format("ON" if s["trailing_tp"] else "OFF"), callback_data="toggle_trailing_tp"),
+         InlineKeyboardButton("Pullback: ${}".format(s["trailing_pullback"]), callback_data="set_trailing_pullback")],
+        [InlineKeyboardButton("Partial Close: {} at ${}".format("ON" if s["partial_close"] else "OFF", s["partial_tp"]), callback_data="toggle_partial_close")],
+        [InlineKeyboardButton("Partial %: {}%".format(s["partial_pct"]), callback_data="set_partial_pct"),
+         InlineKeyboardButton("Partial TP: ${}".format(s["partial_tp"]), callback_data="set_partial_tp")],
+        [InlineKeyboardButton("ATR SL/TP: {} SL:{}x TP:{}x".format("ON" if s["atr_sl_tp"] else "OFF", s["atr_sl_mult"], s["atr_tp_mult"]), callback_data="toggle_atr_sl_tp")],
+        [InlineKeyboardButton("ATR SL Mult: {}".format(s["atr_sl_mult"]), callback_data="set_atr_sl_mult"),
+         InlineKeyboardButton("ATR TP Mult: {}".format(s["atr_tp_mult"]), callback_data="set_atr_tp_mult")],
+        [InlineKeyboardButton("── PERFORMANCE ──", callback_data="noop")],
+        [InlineKeyboardButton("Perf Tracking: {}".format("ON" if s["perf_tracking"] else "OFF"), callback_data="toggle_perf_tracking")],
+        [InlineKeyboardButton("Min Win Rate: {}%".format(s["perf_min_winrate"]), callback_data="set_perf_min_winrate"),
+         InlineKeyboardButton("Min Trades: {}".format(s["perf_min_trades"]), callback_data="set_perf_min_trades")],
+        [InlineKeyboardButton("Drawdown Recovery: {}".format("ON" if s["drawdown_recovery"] else "OFF"), callback_data="toggle_drawdown_recovery")],
+        [InlineKeyboardButton("Drawdown Threshold: ${}".format(s["drawdown_threshold"]), callback_data="set_drawdown_threshold")],
+        [InlineKeyboardButton("── RISK GLOBAL ──", callback_data="noop")],
+        [InlineKeyboardButton("Max Pair: {}".format(s["max_active_pairs"]), callback_data="set_max_active_pairs"),
+         InlineKeyboardButton("Daily Limit: ${}".format(s["daily_loss_limit"]), callback_data="set_daily_loss_limit")],
+        [InlineKeyboardButton("Margin Warn: {}%".format(s["margin_warning"]), callback_data="set_margin_warning"),
+         InlineKeyboardButton("Margin Stop: {}%".format(s["margin_stop"]), callback_data="set_margin_stop")],
+        [InlineKeyboardButton("── TRADING HOURS ──", callback_data="noop")],
+        [InlineKeyboardButton("Hours: {} {}-{}WIB".format("ON" if s["trading_hours"] else "OFF", s["hour_start"], s["hour_end"]), callback_data="toggle_trading_hours")],
+        [InlineKeyboardButton("Jam Start: {}".format(s["hour_start"]), callback_data="set_hour_start"),
+         InlineKeyboardButton("Jam End: {}".format(s["hour_end"]), callback_data="set_hour_end")],
+        [InlineKeyboardButton("Skip Jumat: {} h>{}".format("ON" if s["skip_friday"] else "OFF", s["skip_friday_hour"]), callback_data="toggle_skip_friday")],
+        [InlineKeyboardButton("Skip Senin: {} h<{}".format("ON" if s["skip_monday"] else "OFF", s["skip_monday_hour"]), callback_data="toggle_skip_monday")],
+        [InlineKeyboardButton("── NEWS ──", callback_data="noop")],
+        [InlineKeyboardButton("News Filter: {}".format("ON" if s["news_filter"] else "OFF"), callback_data="toggle_news_filter")],
+        [InlineKeyboardButton("Sebelum: {}m".format(s["news_pause_before"]), callback_data="set_news_pause_before"),
+         InlineKeyboardButton("Setelah: {}m".format(s["news_pause_after"]), callback_data="set_news_pause_after")],
+        [InlineKeyboardButton("── BOT ──", callback_data="noop")],
+        [InlineKeyboardButton("Interval: {}s".format(s["check_interval"]), callback_data="set_check_interval"),
+         InlineKeyboardButton("Summary: {}s".format(s["notify_interval"]), callback_data="set_notify_interval")],
+        [InlineKeyboardButton("Menu Utama", callback_data="menu_main")],
     ])
 
 def kb_confirm_closeall():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Ya, Close Semua", callback_data="do_closeall"),
-         InlineKeyboardButton("❌ Batal", callback_data="menu_main")],
+        [InlineKeyboardButton("Ya, Close Semua", callback_data="do_closeall"),
+         InlineKeyboardButton("Batal", callback_data="menu_main")],
     ])
 
 def kb_back():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Menu Utama", callback_data="menu_main")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Menu Utama", callback_data="menu_main")]])
 
 
 # ══════════════════════════════════════════
@@ -869,44 +1032,41 @@ def kb_back():
 # ══════════════════════════════════════════
 
 def text_main():
-    s   = settings
-    now = now_wib()
-    trading_ok, trading_reason = is_trading_time()
-    news_pause, news_ev        = is_news_time()
-    estop        = "🚨 EMERGENCY STOP" if emergency_stop else "✅ Normal"
-    if news_pause:
-        title = news_ev["title"][:20] if news_ev else "News"
-        trade_status = "📰 Pause: {}".format(em(title))
-    elif not trading_ok:
-        trade_status = "⏰ {}".format(em(trading_reason))
-    else:
-        trade_status = "✅ Entry OK"
-
-    adx_s  = "ON" if s["adx_filter"]     else "OFF"
-    ttp_s  = "ON" if s["trailing_tp"]    else "OFF"
-    th_s   = "ON" if s["trading_hours"]  else "OFF"
-    nf_s   = "ON" if s["news_filter"]    else "OFF"
-
-    lines = [
-        "🤖 *Forex Bot v3*",
-        "",
-        "Status: {}".format(estop),
-        "Entry: {}".format(trade_status),
-        "Waktu WIB: `{}`".format(em(now.strftime("%H:%M %a"))),
-        "Uptime: `{}`".format(em(uptime_str())),
-        "Pair aktif: `{}/{}`".format(active_pair_count(), settings["max_active_pairs"]),
-        "",
-        "🎯 TP: `${}` \\| 🛑 SL: `${}`".format(em(str(s["total_tp"])), em(str(s["hard_sl"]))),
-        "📉 Layer: `${}` max `{}`".format(em(str(s["layer_trigger"])), s["max_layers"]),
-        "📡 ADX: `{}` \\| 📍 Trailing: `{}`".format(adx_s, ttp_s),
-        "⏰ Hours: `{}` \\| 📰 News: `{}`".format(th_s, nf_s),
-        "",
-        "Pilih menu:",
-    ]
-    return "\n".join(lines)
+    s  = settings
+    ok, reason = is_trading_time()
+    np, nev    = is_news_time()
+    if np:      entry_status = "PAUSE: News"
+    elif not ok: entry_status = "PAUSE: {}".format(reason)
+    else:        entry_status = "OK"
+    rec_str = " | RECOVERY MODE" if recovery_mode else ""
+    return (
+        "FOREX BOT v4\n\n"
+        "Status: {}{}\nEntry: {}\nWaktu: {} WIB\nUptime: {}\nPair: {}/{}\n\n"
+        "TP:${} | SL:${} | Layer:${} max:{}\n"
+        "MTF:{} | RSI:{} | ADX:{} | Corr:{}\n"
+        "Trailing:{} | Partial:{} | ATR:{}\n"
+        "Perf:{} | DrawRecov:{}\n"
+        "Hours:{} | News:{}"
+    ).format(
+        "EMERGENCY STOP" if emergency_stop else "Normal", rec_str,
+        entry_status, now_wib().strftime("%H:%M %a"), uptime_str(),
+        active_pair_count(), settings["max_active_pairs"],
+        s["total_tp"], s["hard_sl"], s["layer_trigger"], s["max_layers"],
+        "ON" if s["mtf_enabled"] else "OFF",
+        "ON" if s["rsi_filter"] else "OFF",
+        "ON" if s["adx_filter"] else "OFF",
+        "ON" if s["correlation_filter"] else "OFF",
+        "ON" if s["trailing_tp"] else "OFF",
+        "ON" if s["partial_close"] else "OFF",
+        "ON" if s["atr_sl_tp"] else "OFF",
+        "ON" if s["perf_tracking"] else "OFF",
+        "ON" if s["drawdown_recovery"] else "OFF",
+        "ON" if s["trading_hours"] else "OFF",
+        "ON" if s["news_filter"] else "OFF",
+    )
 
 async def text_positions():
-    lines = ["📈 *Status Posisi*\n"]
+    lines = ["STATUS POSISI\n"]
     grand_total = 0.0
     any_trade   = False
     for pair in ALL_PAIRS:
@@ -917,111 +1077,113 @@ async def text_positions():
             total_pl     = get_total_pl(ot)
             grand_total += total_pl
             n_buy, n_sell = count_buy_sell(ot)
-            icon  = "✅" if pair_active.get(pair) else "⭕"
-            arrow = "📈" if total_pl >= 0 else "📉"
-            peak  = pair_state[pair]["peak_profit"]
-            peak_str = " \\| Peak: `{}`".format(em("${:.2f}".format(peak))) if peak > 0 else ""
-            lines.append("{} *{}*\n  {} B:`{}` S:`{}` P/L:`{}`{}".format(
-                icon, em(pair_label(pair)), arrow, n_buy, n_sell,
-                em("${:.2f}".format(total_pl)), peak_str))
-        except Exception:
-            pass
-    if not any_trade:
-        lines.append("_Tidak ada posisi terbuka_")
-    else:
-        arrow = "📈" if grand_total >= 0 else "📉"
-        lines.append("\n{} *Grand Total: `{}`*".format(arrow, em("${:.2f}".format(grand_total))))
+            state  = pair_state[pair]
+            peak   = state["peak_profit"]
+            atr_sl = state["atr_sl"]
+            atr_tp = state["atr_tp"]
+            sl_str = "${:.2f}".format(atr_sl) if atr_sl else str(settings["hard_sl"])
+            tp_str = "${:.2f}".format(atr_tp) if atr_tp else str(settings["total_tp"])
+            arrow  = "UP" if total_pl >= 0 else "DN"
+            icon   = "ON" if pair_active.get(pair) else "OFF"
+            lines.append(
+                "[{}] {} | {} B:{} S:{} PL:${:.2f} Peak:${:.2f}\n  SL:{} TP:{} Partial:{}".format(
+                    icon, pair_label(pair), arrow, n_buy, n_sell,
+                    total_pl, peak, sl_str, tp_str,
+                    "done" if state["partial_done"] else "no"
+                )
+            )
+        except Exception: pass
+    if not any_trade: lines.append("Tidak ada posisi terbuka")
+    else: lines.append("\nGrand Total: ${:.2f}".format(grand_total))
     return "\n".join(lines)
 
 async def text_account():
     try:
         info = get_account_info()
-        ml   = info["margin_level"]
-        ml_icon = "🔴" if ml < settings["margin_stop"] else ("🟡" if ml < settings["margin_warning"] else "🟢")
         lot  = get_lot_size(info["balance"])
-        wr   = "{:.0f}%".format(daily_stats["wins"] / daily_stats["trades"] * 100) if daily_stats["trades"] > 0 else "N/A"
+        wr   = "{:.0f}%".format(daily_stats["wins"]/daily_stats["trades"]*100) if daily_stats["trades"] > 0 else "N/A"
+        ml   = info["margin_level"]
+        ml_s = "KRITIS" if ml < settings["margin_stop"] else ("WARN" if ml < settings["margin_warning"] else "OK")
         return (
-            "📊 *Status Akun*\n\n"
-            "💰 Balance: `{}`\n"
-            "📈 NAV: `{}`\n"
-            "📉 Floating P/L: `{}`\n"
-            "🔒 Margin Used: `{}`\n"
-            "🟢 Free Margin: `{}`\n"
-            "{} Margin Level: `{}%`\n"
-            "📦 Lot aktif: `{}`\n\n"
-            "🤖 Pair: `{}/{}` \\| Uptime: `{}`\n"
-            "🌐 Env: `{}`\n\n"
-            "📊 *Statistik Sesi*\n"
-            "Trade: `{}` \\| Win: `{}` \\| Loss: `{}`\n"
-            "Win Rate: `{}` \\| P/L: `{}`"
+            "STATUS AKUN\n\n"
+            "Balance: ${:.2f}\nNAV: ${:.2f}\nFloating: ${:.2f}\n"
+            "Margin Used: ${:.2f}\nFree Margin: ${:.2f}\n"
+            "Margin Level: {}% [{}]\n"
+            "Lot aktif: {}\nRecovery Mode: {}\n\n"
+            "Pair: {}/{} | Uptime: {}\nEnv: {}\n\n"
+            "STATISTIK SESI\n"
+            "Trade:{} Win:{} Loss:{}\nWin Rate:{} | P/L:${:.2f}"
         ).format(
-            em("${:.2f}".format(info["balance"])),
-            em("${:.2f}".format(info["nav"])),
-            em("${:.2f}".format(info["pl"])),
-            em("${:.2f}".format(info["margin"])),
-            em("${:.2f}".format(info["free_margin"])),
-            ml_icon, em(str(ml)),
-            em(str(round(lot, 4))),
-            active_pair_count(), settings["max_active_pairs"],
-            em(uptime_str()), OANDA_ENV,
+            info["balance"], info["nav"], info["pl"],
+            info["margin"], info["free_margin"],
+            ml, ml_s, round(lot, 4),
+            "ON" if recovery_mode else "OFF",
+            active_pair_count(), len(ALL_PAIRS), uptime_str(), OANDA_ENV,
             daily_stats["trades"], daily_stats["wins"], daily_stats["losses"],
-            em(wr), em("${:.2f}".format(daily_stats["total_pl"]))
+            wr, daily_stats["total_pl"]
         )
     except Exception as e:
-        return "❌ Error: `{}`".format(em(str(e)))
+        return "Error akun: {}".format(str(e))
 
-def text_news():
+def text_performance():
+    lines = ["PERFORMANCE PER PAIR\n"]
+    for pair in ALL_PAIRS:
+        perf = pair_perf[pair]
+        if perf["trades"] == 0: continue
+        wr     = perf["wins"] / perf["trades"] * 100
+        status = "DISABLED" if perf["disabled_by_perf"] else ("ON" if pair_active.get(pair) else "OFF")
+        lines.append(
+            "[{}] {} | Trade:{} WR:{:.0f}% PL:${:.2f}".format(
+                status, pair_label(pair), perf["trades"], wr, perf["total_pl"]
+            )
+        )
+    if len(lines) == 1: lines.append("Belum ada data trade")
+    return "\n".join(lines)
+
+def text_correlation():
+    lines = ["KORELASI PAIR\n", "Filter: {}\n".format("ON" if settings["correlation_filter"] else "OFF")]
+    for i, group in enumerate(CORRELATION_GROUPS):
+        active_in_group = [p for p in group if pair_active.get(p)]
+        lines.append("Grup {}: {}".format(i+1, ", ".join(pair_label(p) for p in group)))
+        if active_in_group:
+            lines.append("  Aktif: {}".format(", ".join(pair_label(p) for p in active_in_group)))
+    return "\n".join(lines)
+
+def text_news_page():
     upcoming = get_upcoming_news(8)
+    lines    = ["HIGH-IMPACT NEWS MINGGU INI\n"]
+    np, _    = is_news_time()
+    if np: lines.append("BOT PAUSE KARENA NEWS\n")
     if not upcoming:
-        return "📰 *High\\-Impact News*\n\n_Tidak ada news minggu ini atau gagal fetch_"
-    lines = ["📰 *High\\-Impact News \\(Minggu Ini\\)*\n"]
-    now   = datetime.now()
-    is_pause, _ = is_news_time()
-    if is_pause:
-        lines.append("⚠️ *BOT SEDANG PAUSE KARENA NEWS*\n")
+        lines.append("Tidak ada news atau gagal fetch")
     for ev in upcoming:
-        diff_min = int((ev["time"] - now).total_seconds() / 60)
-        if diff_min < 60:
-            when = "{}m lagi".format(diff_min)
-        else:
-            when = ev["time"].strftime("%a %H:%M WIB")
-        lines.append("🔴 *{}* \\- {}\n    `{}`".format(
-            em(ev["country"]), em(ev["title"]), em(when)))
+        diff = int((ev["time"] - datetime.now()).total_seconds() / 60)
+        when = "{}m lagi".format(diff) if diff < 60 else ev["time"].strftime("%a %H:%M WIB")
+        lines.append("{} | {}".format(when, ev["title"]))
     return "\n".join(lines)
 
 def text_hours():
     s  = settings
     ok, reason = is_trading_time()
-    now = now_wib()
-    status = "✅ Entry OK" if ok else "⏰ {}".format(reason)
     return (
-        "⏰ *Trading Hours*\n\n"
-        "Sekarang: `{}` WIB\n"
-        "Status: {}\n\n"
-        "Trading Hours: `{}`\n"
-        "Jam aktif: `{}:00 \u2013 {}:00 WIB`\n\n"
-        "Skip Jumat setelah `{}:00`: `{}`\n"
-        "Skip Senin sebelum `{}:00`: `{}`\n\n"
-        "_Sesi London\\+NY: 15:00\\-23:00 WIB_\n"
-        "_Sesi Tokyo: 07:00\\-15:00 WIB_"
+        "TRADING HOURS\n\nSekarang: {} WIB\nStatus: {}\n\n"
+        "Hours: {} | {}:00-{}:00 WIB\n"
+        "Skip Jumat >{}:00: {}\nSkip Senin <{}:00: {}\n\n"
+        "Sesi London+NY: 15:00-23:00 WIB\nSesi Tokyo: 07:00-15:00 WIB"
     ).format(
-        em(now.strftime("%H:%M %a")),
-        em(status),
-        "ON ✅" if s["trading_hours"] else "OFF ⭕",
-        s["hour_start"], s["hour_end"],
-        s["skip_friday_hour"], "ON ✅" if s["skip_friday"] else "OFF ⭕",
-        s["skip_monday_hour"], "ON ✅" if s["skip_monday"] else "OFF ⭕",
+        now_wib().strftime("%H:%M %a"),
+        "OK" if ok else reason,
+        "ON" if s["trading_hours"] else "OFF", s["hour_start"], s["hour_end"],
+        s["skip_friday_hour"], "ON" if s["skip_friday"] else "OFF",
+        s["skip_monday_hour"], "ON" if s["skip_monday"] else "OFF",
     )
 
 def text_log():
-    if not trade_log:
-        return "📜 *Log Trade*\n\n_Belum ada trade_"
-    lines = ["📜 *Log Trade*\n"]
+    if not trade_log: return "LOG TRADE\n\nBelum ada trade"
+    lines = ["LOG TRADE (30 terakhir)\n"]
     for t in reversed(trade_log[-30:]):
-        pl_str = " `{}`".format(em("${:.2f}".format(t["pl"]))) if t["pl"] is not None else ""
-        icon   = "📈" if t["direction"] == "buy" else ("📉" if t["direction"] == "sell" else "🔄")
-        lines.append("{} `{}` *{}* {}{}".format(
-            icon, t["time"], em(t["pair"]), em(t["action"]), pl_str))
+        pl = " ${:.2f}".format(t["pl"]) if t["pl"] is not None else ""
+        lines.append("{} {} {} {}{}".format(t["time"], t["pair"], t["direction"], t["action"], pl))
     return "\n".join(lines)
 
 
@@ -1030,45 +1192,68 @@ def text_log():
 # ══════════════════════════════════════════
 
 SETTING_LABELS = {
-    "lot_size":           "Lot Size base (sekarang: {})\nContoh: 0.01",
-    "dynamic_lot_per":    "Dynamic lot per $X balance (sekarang: {})\nContoh: 1000 = 0.01 lot per $1000",
-    "ema_fast":           "EMA Fast (sekarang: {})\nContoh: 20",
-    "ema_slow":           "EMA Slow (sekarang: {})\nContoh: 50",
-    "layer_trigger":      "Layer Trigger $ (sekarang: {})\nHarus negatif, contoh: -10",
-    "max_layers":         "Max Layers (sekarang: {})\nContoh: 5",
-    "total_tp":           "Take Profit $ (sekarang: {})\nContoh: 25",
-    "hard_sl":            "Hard SL $ (sekarang: {})\nHarus negatif, contoh: -30",
-    "trailing_pullback":  "Trailing Pullback $ (sekarang: {})\nContoh: 3",
-    "adx_min":            "ADX Minimum (sekarang: {})\nContoh: 20",
-    "hour_start":         "Jam mulai trading WIB (sekarang: {})\nContoh: 15",
-    "hour_end":           "Jam selesai trading WIB (sekarang: {})\nContoh: 23",
-    "skip_friday_hour":   "Skip Jumat setelah jam WIB (sekarang: {})\nContoh: 21",
-    "skip_monday_hour":   "Skip Senin sebelum jam WIB (sekarang: {})\nContoh: 10",
-    "news_pause_before":  "Pause sebelum news (menit) (sekarang: {})\nContoh: 30",
-    "news_pause_after":   "Pause setelah news (menit) (sekarang: {})\nContoh: 30",
-    "margin_warning":     "Margin warning level % (sekarang: {})\nContoh: 200",
-    "margin_stop":        "Margin stop level % (sekarang: {})\nContoh: 150",
-    "max_active_pairs":   "Max pair aktif (sekarang: {})\nContoh: 5",
-    "daily_loss_limit":   "Daily loss limit $ (sekarang: {})\nHarus negatif, contoh: -100",
-    "check_interval":     "Check interval detik (sekarang: {})\nMinimal 10",
-    "notify_interval":    "Auto summary detik (sekarang: {})\n0 = nonaktif",
+    "lot_size":           "Lot Size base (skrg: {})\nContoh: 0.01",
+    "dynamic_lot_per":    "Dynamic lot per $X balance (skrg: {})\nContoh: 1000",
+    "ema_fast":           "EMA Fast (skrg: {})\nContoh: 20",
+    "ema_slow":           "EMA Slow (skrg: {})\nContoh: 50",
+    "rsi_period":         "RSI Period (skrg: {})\nContoh: 14",
+    "rsi_buy_min":        "RSI min untuk BUY (skrg: {})\nContoh: 50",
+    "rsi_sell_max":       "RSI max untuk SELL (skrg: {})\nContoh: 50",
+    "adx_min":            "ADX Minimum (skrg: {})\nContoh: 20",
+    "layer_trigger":      "Layer Trigger $ (skrg: {})\nHarus negatif: -10",
+    "max_layers":         "Max Layers (skrg: {})\nContoh: 5",
+    "total_tp":           "Take Profit $ (skrg: {})\nContoh: 25",
+    "hard_sl":            "Hard SL $ (skrg: {})\nHarus negatif: -30",
+    "trailing_pullback":  "Trailing Pullback $ (skrg: {})\nContoh: 3",
+    "partial_tp":         "Partial TP $ (skrg: {})\nContoh: 15",
+    "partial_pct":        "Partial % (skrg: {})\nContoh: 50",
+    "atr_period":         "ATR Period (skrg: {})\nContoh: 14",
+    "atr_sl_mult":        "ATR SL Multiplier (skrg: {})\nContoh: 1.5",
+    "atr_tp_mult":        "ATR TP Multiplier (skrg: {})\nContoh: 3.0",
+    "perf_min_winrate":   "Min Win Rate % (skrg: {})\nContoh: 40",
+    "perf_min_trades":    "Min Trade sebelum evaluasi (skrg: {})\nContoh: 10",
+    "drawdown_threshold": "Drawdown Threshold $ (skrg: {})\nHarus negatif: -20",
+    "max_active_pairs":   "Max Pair Aktif (skrg: {})\nContoh: 5",
+    "daily_loss_limit":   "Daily Loss Limit $ (skrg: {})\nHarus negatif: -100",
+    "margin_warning":     "Margin Warning % (skrg: {})\nContoh: 200",
+    "margin_stop":        "Margin Stop % (skrg: {})\nContoh: 150",
+    "hour_start":         "Jam mulai WIB (skrg: {})\nContoh: 15",
+    "hour_end":           "Jam selesai WIB (skrg: {})\nContoh: 23",
+    "skip_friday_hour":   "Skip Jumat setelah jam (skrg: {})\nContoh: 21",
+    "skip_monday_hour":   "Skip Senin sebelum jam (skrg: {})\nContoh: 10",
+    "news_pause_before":  "Pause sebelum news menit (skrg: {})\nContoh: 30",
+    "news_pause_after":   "Pause setelah news menit (skrg: {})\nContoh: 30",
+    "check_interval":     "Interval detik (skrg: {})\nMinimal 10",
+    "notify_interval":    "Auto summary detik (skrg: {})\n0 = nonaktif",
+    "max_corr_pairs":     "Max pair per korelasi grup (skrg: {})\nContoh: 1",
+    "breakeven_trigger":  "Breakeven trigger $ (skrg: {})\nContoh: 5",
 }
 
 INT_SETTINGS = {
-    "ema_fast", "ema_slow", "check_interval", "max_layers", "max_active_pairs",
-    "notify_interval", "adx_min", "hour_start", "hour_end", "skip_friday_hour",
+    "ema_fast", "ema_slow", "rsi_period", "rsi_buy_min", "rsi_sell_max",
+    "adx_min", "max_layers", "max_active_pairs", "notify_interval",
+    "check_interval", "hour_start", "hour_end", "skip_friday_hour",
     "skip_monday_hour", "news_pause_before", "news_pause_after",
-    "margin_warning", "margin_stop",
+    "margin_warning", "margin_stop", "perf_min_winrate", "perf_min_trades",
+    "partial_pct", "atr_period", "max_corr_pairs",
 }
 
 TOGGLE_SETTINGS = {
-    "toggle_adx_filter":     ("adx_filter",     "ADX Filter"),
-    "toggle_trailing_tp":    ("trailing_tp",     "Trailing TP"),
-    "toggle_trading_hours":  ("trading_hours",   "Trading Hours"),
-    "toggle_news_filter":    ("news_filter",     "News Filter"),
-    "toggle_dynamic_lot":    ("dynamic_lot",     "Dynamic Lot"),
-    "toggle_skip_friday":    ("skip_friday",     "Skip Jumat"),
-    "toggle_skip_monday":    ("skip_monday",     "Skip Senin"),
+    "toggle_dynamic_lot":       ("dynamic_lot",       "Dynamic Lot"),
+    "toggle_mtf_enabled":       ("mtf_enabled",       "Multi-TF H4"),
+    "toggle_rsi_filter":        ("rsi_filter",        "RSI Filter"),
+    "toggle_adx_filter":        ("adx_filter",        "ADX Filter"),
+    "toggle_correlation_filter":("correlation_filter","Correlation Filter"),
+    "toggle_fib_layers":        ("fib_layers",        "Fibonacci Layers"),
+    "toggle_trailing_tp":       ("trailing_tp",       "Trailing TP"),
+    "toggle_partial_close":     ("partial_close",     "Partial Close"),
+    "toggle_atr_sl_tp":         ("atr_sl_tp",         "ATR SL/TP"),
+    "toggle_perf_tracking":     ("perf_tracking",     "Perf Tracking"),
+    "toggle_drawdown_recovery": ("drawdown_recovery", "Drawdown Recovery"),
+    "toggle_trading_hours":     ("trading_hours",     "Trading Hours"),
+    "toggle_news_filter":       ("news_filter",       "News Filter"),
+    "toggle_skip_friday":       ("skip_friday",       "Skip Jumat"),
+    "toggle_skip_monday":       ("skip_monday",       "Skip Senin"),
 }
 
 
@@ -1080,7 +1265,7 @@ async def start_command(update, context):
     global bot_start_time
     if not is_allowed(update): return
     if not bot_start_time: bot_start_time = datetime.now()
-    await update.message.reply_text(text_main(), parse_mode="MarkdownV2", reply_markup=kb_main())
+    await update.message.reply_text(text_main(), reply_markup=kb_main())
 
 async def testentry_command(update, context):
     if not is_allowed(update): return
@@ -1089,19 +1274,16 @@ async def testentry_command(update, context):
     for direction in ["buy", "sell"]:
         try:
             units = "1000" if direction == "buy" else "-1000"
-            r = orders.OrderCreate(ACCOUNT_ID, data={
-                "order": {"type": "MARKET", "instrument": "EUR_USD", "units": units}
-            })
+            r = orders.OrderCreate(ACCOUNT_ID, data={"order": {"type": "MARKET", "instrument": "EUR_USD", "units": units}})
             client.request(r)
             trade_id = r.response["orderFillTransaction"]["tradeOpened"]["tradeID"]
-            results.append("OK {} - Trade ID: {}".format(direction.upper(), trade_id))
+            results.append("OK {} ID:{}".format(direction.upper(), trade_id))
             await asyncio.sleep(1)
             client.request(trades.TradeClose(ACCOUNT_ID, tradeID=trade_id))
-            results.append("OK {} closed.".format(direction.upper()))
+            results.append("OK {} closed".format(direction.upper()))
         except Exception as e:
-            results.append("FAIL {}: {}".format(direction.upper(), str(e)))
-    msg = "Test Entry Result:\n\n" + "\n".join(results)
-    await update.message.reply_text(msg)
+            results.append("FAIL {}: {}".format(direction.upper(), str(e)[:80]))
+    await update.message.reply_text("Test Entry:\n" + "\n".join(results))
 
 async def button_handler(update, context):
     global emergency_stop
@@ -1111,101 +1293,122 @@ async def button_handler(update, context):
     data = query.data
 
     async def edit_main():
-        await query.edit_message_text(text_main(), parse_mode="MarkdownV2", reply_markup=kb_main())
-    async def edit_settings():
-        await query.edit_message_text("⚙️ *Setting Bot v3*\n\nKetuk untuk ubah:", parse_mode="MarkdownV2", reply_markup=kb_settings())
+        try: await query.edit_message_text(text_main(), reply_markup=kb_main())
+        except Exception: pass
 
-    if data == "menu_main":       await edit_main()
+    async def edit_settings():
+        try: await query.edit_message_text("SETTING BOT v4\nKetuk untuk ubah:", reply_markup=kb_settings())
+        except Exception: pass
+
+    if   data == "menu_main":     await edit_main()
     elif data == "menu_settings": await edit_settings()
     elif data == "noop":          pass
 
     elif data == "menu_pairs":
         cnt, mx = active_pair_count(), settings["max_active_pairs"]
-        await query.edit_message_text(
-            "📋 *Kelola Pair*\n\nAktif: `{}/{}` \\(maks {}\\)\nKetuk untuk toggle:".format(cnt, len(ALL_PAIRS), mx),
-            parse_mode="MarkdownV2", reply_markup=kb_pairs(0))
+        try:
+            await query.edit_message_text(
+                "KELOLA PAIR\nAktif: {}/{} (maks {})\nKetuk untuk toggle:".format(cnt, len(ALL_PAIRS), mx),
+                reply_markup=kb_pairs(0))
+        except Exception: pass
 
     elif data.startswith("pairs_page_"):
         page = int(data[len("pairs_page_"):])
         cnt, mx = active_pair_count(), settings["max_active_pairs"]
-        await query.edit_message_text(
-            "📋 *Kelola Pair*\n\nAktif: `{}/{}` \\(maks {}\\)\nKetuk untuk toggle:".format(cnt, len(ALL_PAIRS), mx),
-            parse_mode="MarkdownV2", reply_markup=kb_pairs(page))
+        try:
+            await query.edit_message_text(
+                "KELOLA PAIR\nAktif: {}/{} (maks {})\nKetuk untuk toggle:".format(cnt, len(ALL_PAIRS), mx),
+                reply_markup=kb_pairs(page))
+        except Exception: pass
 
     elif data.startswith("toggle_") and data not in TOGGLE_SETTINGS and data != "toggle_estop":
         pair = data[len("toggle_"):]
         if pair not in ALL_PAIRS: return
         if pair_active.get(pair):
             stop_pair(pair)
-            await query.answer("{} ⏹ OFF".format(pair_label(pair)))
+            await query.answer("{} OFF".format(pair_label(pair)))
         else:
             if emergency_stop:
-                await query.answer("⚠️ Emergency Stop aktif!", show_alert=True); return
+                await query.answer("Emergency Stop aktif!", show_alert=True); return
             result = start_pair(pair, context.application)
             if result == "max":
-                await query.answer("⚠️ Maks {} pair!".format(settings["max_active_pairs"]), show_alert=True); return
+                await query.answer("Maks {} pair!".format(settings["max_active_pairs"]), show_alert=True); return
             if result == "unavailable":
-                await query.answer("🚫 {} tidak tersedia di akun ini".format(pair_label(pair)), show_alert=True); return
-            await query.answer("{} ✅ ON".format(pair_label(pair)))
+                await query.answer("{} tidak tersedia".format(pair_label(pair)), show_alert=True); return
+            if result == "perf":
+                await query.answer("{} dinonaktifkan karena win rate rendah".format(pair_label(pair)), show_alert=True); return
+            await query.answer("{} ON".format(pair_label(pair)))
         cnt, mx = active_pair_count(), settings["max_active_pairs"]
         try:
             await query.edit_message_text(
-                "📋 *Kelola Pair*\n\nAktif: `{}/{}` \\(maks {}\\)\nKetuk untuk toggle:".format(cnt, len(ALL_PAIRS), mx),
-                parse_mode="MarkdownV2", reply_markup=kb_pairs(0))
+                "KELOLA PAIR\nAktif: {}/{} (maks {})\nKetuk untuk toggle:".format(cnt, len(ALL_PAIRS), mx),
+                reply_markup=kb_pairs(0))
         except Exception: pass
 
     elif data in TOGGLE_SETTINGS:
         key, label = TOGGLE_SETTINGS[data]
         settings[key] = not settings[key]
-        status = "ON ✅" if settings[key] else "OFF ⭕"
-        await query.answer("{}: {}".format(label, status))
+        await query.answer("{}: {}".format(label, "ON" if settings[key] else "OFF"))
         await edit_settings()
 
     elif data == "toggle_estop":
         if emergency_stop:
             emergency_stop = False
-            await query.answer("✅ Emergency Stop direset!", show_alert=True)
+            await query.answer("Emergency Stop direset!", show_alert=True)
         else:
             emergency_stop = True
-            for pair in ALL_PAIRS: stop_pair(pair)
-            await query.answer("🚨 Emergency Stop aktif!", show_alert=True)
+            for p in ALL_PAIRS: stop_pair(p)
+            await query.answer("EMERGENCY STOP aktif!", show_alert=True)
         await edit_main()
 
     elif data == "all_on":
         if emergency_stop:
-            await query.answer("⚠️ Emergency Stop aktif!", show_alert=True); return
+            await query.answer("Emergency Stop aktif!", show_alert=True); return
         count = 0
         for pair in ALL_PAIRS:
             if active_pair_count() >= settings["max_active_pairs"]: break
             if start_pair(pair, context.application) is True: count += 1
-        await query.answer("✅ {} pair ON!".format(count), show_alert=True)
+        await query.answer("{} pair ON!".format(count), show_alert=True)
         await edit_main()
 
     elif data == "all_off":
-        for pair in ALL_PAIRS: stop_pair(pair)
-        await query.answer("⏹ Semua OFF!", show_alert=True)
+        for p in ALL_PAIRS: stop_pair(p)
+        await query.answer("Semua pair OFF!", show_alert=True)
         await edit_main()
 
     elif data == "menu_account":
         txt = await text_account()
-        await query.edit_message_text(txt, parse_mode="MarkdownV2", reply_markup=kb_back())
+        try: await query.edit_message_text(txt, reply_markup=kb_back())
+        except Exception: pass
 
     elif data == "menu_positions":
         txt = await text_positions()
-        await query.edit_message_text(txt, parse_mode="MarkdownV2", reply_markup=kb_back())
+        try: await query.edit_message_text(txt, reply_markup=kb_back())
+        except Exception: pass
 
     elif data == "menu_log":
-        await query.edit_message_text(text_log(), parse_mode="MarkdownV2", reply_markup=kb_back())
+        try: await query.edit_message_text(text_log(), reply_markup=kb_back())
+        except Exception: pass
 
     elif data == "menu_news":
-        await query.edit_message_text(text_news(), parse_mode="MarkdownV2", reply_markup=kb_back())
+        try: await query.edit_message_text(text_news_page(), reply_markup=kb_back())
+        except Exception: pass
 
     elif data == "menu_hours":
-        await query.edit_message_text(text_hours(), parse_mode="MarkdownV2", reply_markup=kb_back())
+        try: await query.edit_message_text(text_hours(), reply_markup=kb_back())
+        except Exception: pass
+
+    elif data == "menu_perf":
+        try: await query.edit_message_text(text_performance(), reply_markup=kb_back())
+        except Exception: pass
+
+    elif data == "menu_corr":
+        try: await query.edit_message_text(text_correlation(), reply_markup=kb_back())
+        except Exception: pass
 
     elif data == "confirm_closeall":
-        await query.edit_message_text(
-            "⚠️ *Yakin close SEMUA posisi?*", parse_mode="MarkdownV2", reply_markup=kb_confirm_closeall())
+        try: await query.edit_message_text("Yakin close SEMUA posisi?", reply_markup=kb_confirm_closeall())
+        except Exception: pass
 
     elif data == "do_closeall":
         closed, total = 0, 0.0
@@ -1217,20 +1420,19 @@ async def button_handler(update, context):
                     total += pl; closed += len(ot)
                     log_trade(pair, "all", "manual_close", pl)
                     pair_state[pair]["peak_profit"] = 0.0
-            except Exception as e:
-                logger.error("closeall [%s]: %s", pair, e)
-        await query.edit_message_text(
-            "✅ Ditutup: `{}` posisi\nTotal P/L: `{}`".format(closed, em("${:.2f}".format(total))),
-            parse_mode="MarkdownV2", reply_markup=kb_back())
+            except Exception as e: logger.error("closeall [%s]: %s", pair, e)
+        try: await query.edit_message_text("Ditutup: {} posisi\nTotal P/L: ${:.2f}".format(closed, total), reply_markup=kb_back())
+        except Exception: pass
 
     elif data.startswith("set_"):
         key = data[len("set_"):]
         pending_setting_key[query.from_user.id] = key
         label = SETTING_LABELS.get(key, key).format(settings.get(key, "?"))
-        await query.edit_message_text(
-            "✏️ *Ubah {}*\n\n{}\n\nKirim nilai baru:".format(em(key), em(label)),
-            parse_mode="MarkdownV2",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Batal", callback_data="menu_settings")]]))
+        try:
+            await query.edit_message_text(
+                "Ubah {}\n\n{}\n\nKirim nilai baru:".format(key, label),
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Batal", callback_data="menu_settings")]]))
+        except Exception: pass
 
 
 async def receive_setting_value(update, context):
@@ -1241,31 +1443,39 @@ async def receive_setting_value(update, context):
     text = update.message.text.strip()
     try:
         value = float(text)
-        # Validasi spesifik
         validators = {
-            "lot_size":          (value > 0,                               "Harus > 0"),
-            "layer_trigger":     (value < 0,                               "Harus negatif"),
-            "max_layers":        (value >= 1,                              "Minimal 1"),
-            "total_tp":          (value > 0,                               "Harus > 0"),
-            "hard_sl":           (value < 0,                               "Harus negatif"),
-            "trailing_pullback": (value > 0,                               "Harus > 0"),
-            "adx_min":           (1 <= value <= 100,                       "Antara 1-100"),
-            "max_active_pairs":  (1 <= value <= len(ALL_PAIRS),            "Antara 1-{}".format(len(ALL_PAIRS))),
-            "daily_loss_limit":  (value < 0,                               "Harus negatif"),
-            "check_interval":    (value >= 10,                             "Minimal 10"),
-            "notify_interval":   (value >= 0,                              "Minimal 0"),
-            "ema_fast":          (value >= 2,                              "Minimal 2"),
-            "ema_slow":          (value >= 2,                              "Minimal 2"),
-            "hour_start":        (0 <= value <= 23,                        "Antara 0-23"),
-            "hour_end":          (0 <= value <= 23,                        "Antara 0-23"),
-            "margin_warning":    (value > 0,                               "Harus > 0"),
-            "margin_stop":       (value > 0,                               "Harus > 0"),
-            "news_pause_before": (value >= 0,                              "Minimal 0"),
-            "news_pause_after":  (value >= 0,                              "Minimal 0"),
+            "lot_size":           value > 0,
+            "layer_trigger":      value < 0,
+            "max_layers":         value >= 1,
+            "total_tp":           value > 0,
+            "hard_sl":            value < 0,
+            "trailing_pullback":  value > 0,
+            "adx_min":            1 <= value <= 100,
+            "rsi_buy_min":        0 <= value <= 100,
+            "rsi_sell_max":       0 <= value <= 100,
+            "max_active_pairs":   1 <= value <= len(ALL_PAIRS),
+            "daily_loss_limit":   value < 0,
+            "check_interval":     value >= 10,
+            "notify_interval":    value >= 0,
+            "ema_fast":           value >= 2,
+            "ema_slow":           value >= 2,
+            "hour_start":         0 <= value <= 23,
+            "hour_end":           0 <= value <= 23,
+            "margin_warning":     value > 0,
+            "margin_stop":        value > 0,
+            "news_pause_before":  value >= 0,
+            "news_pause_after":   value >= 0,
+            "partial_pct":        0 < value <= 100,
+            "partial_tp":         value > 0,
+            "atr_sl_mult":        value > 0,
+            "atr_tp_mult":        value > 0,
+            "perf_min_winrate":   0 <= value <= 100,
+            "perf_min_trades":    value >= 1,
+            "drawdown_threshold": value < 0,
+            "max_corr_pairs":     value >= 1,
         }
-        if key in validators:
-            ok, msg = validators[key]
-            if not ok: raise ValueError(msg)
+        if key in validators and not validators[key]:
+            raise ValueError("Nilai tidak valid untuk {}".format(key))
         if key == "ema_fast" and value >= settings["ema_slow"]:
             raise ValueError("EMA Fast harus < EMA Slow")
         if key == "ema_slow" and value <= settings["ema_fast"]:
@@ -1275,15 +1485,10 @@ async def receive_setting_value(update, context):
 
         settings[key] = int(value) if key in INT_SETTINGS else value
         del pending_setting_key[user_id]
-        await update.message.reply_text(
-            "✅ *{}* \u2192 `{}`".format(em(key), em(str(settings[key]))),
-            parse_mode="MarkdownV2")
-        await update.message.reply_text(
-            "⚙️ *Setting Bot v3*\n\nKetuk untuk ubah:",
-            parse_mode="MarkdownV2", reply_markup=kb_settings())
+        await update.message.reply_text("{} -> {}".format(key, settings[key]))
+        await update.message.reply_text("SETTING BOT v4\nKetuk untuk ubah:", reply_markup=kb_settings())
     except ValueError as e:
-        await update.message.reply_text(
-            "❌ `{}`\nCoba lagi:".format(em(str(e))), parse_mode="MarkdownV2")
+        await update.message.reply_text("Error: {}\nCoba lagi:".format(str(e)))
 
 
 # ══════════════════════════════════════════
@@ -1295,19 +1500,20 @@ async def post_init(app):
     bot_start_time = datetime.now()
     asyncio.create_task(monitor_daily_loss(app))
     asyncio.create_task(monitor_margin(app))
+    asyncio.create_task(monitor_drawdown(app))
+    asyncio.create_task(monitor_performance(app))
     asyncio.create_task(auto_summary(app))
-    # Pre-fetch news
     asyncio.create_task(asyncio.to_thread(fetch_news))
-    logger.info("Bot v3 background tasks started.")
+    logger.info("Bot v4 started.")
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("start",     start_command))
+    app.add_handler(CommandHandler("menu",      start_command))
     app.add_handler(CommandHandler("testentry", testentry_command))
-    app.add_handler(CommandHandler("menu",  start_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_setting_value))
-    logger.info("Bot v3 siap.")
+    logger.info("Bot v4 siap.")
     app.run_polling()
 
 if __name__ == "__main__":
