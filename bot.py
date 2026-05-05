@@ -216,19 +216,36 @@ def log_trade(pair, direction, action, pl=None):
 # CANDLES (direct REST — lebih reliable)
 # ══════════════════════════════════════════
 
-def get_candles(pair, count=60, granularity="D"):
+def get_candles(pair, count=60, granularity="D", retries=3):
     base = "https://api-fxpractice.oanda.com" if OANDA_ENV == "practice" else "https://api-fxtrade.oanda.com"
     url  = "{}/v3/instruments/{}/candles".format(base, pair)
-    resp = req_lib.get(url,
-        headers={"Authorization": "Bearer " + OANDA_TOKEN, "Content-Type": "application/json"},
-        params={"count": str(count), "granularity": granularity, "price": "M"},
-        timeout=10)
-    if resp.status_code != 200:
-        raise Exception("{} {}".format(resp.status_code, resp.text))
-    data = resp.json()
-    if "candles" not in data:
-        raise Exception("No candles: {}".format(data))
-    return data["candles"]
+    last_err = None
+    for attempt in range(retries):
+        try:
+            resp = req_lib.get(url,
+                headers={"Authorization": "Bearer " + OANDA_TOKEN, "Content-Type": "application/json"},
+                params={"count": str(count), "granularity": granularity, "price": "M"},
+                timeout=15)
+            # 5xx error = server problem, retry
+            if resp.status_code in (500, 502, 503, 504):
+                last_err = Exception("{} server error".format(resp.status_code))
+                import time; time.sleep(3)
+                continue
+            if resp.status_code != 200:
+                raise Exception("{} {}".format(resp.status_code, resp.text[:200]))
+            data = resp.json()
+            if "candles" not in data:
+                raise Exception("No candles: {}".format(data))
+            return data["candles"]
+        except req_lib.exceptions.Timeout:
+            last_err = Exception("Timeout")
+            import time; time.sleep(3)
+            continue
+        except req_lib.exceptions.ConnectionError as e:
+            last_err = e
+            import time; time.sleep(3)
+            continue
+    raise last_err or Exception("get_candles failed after {} retries".format(retries))
 
 def get_closes(pair, count=60, granularity="D"):
     candles = get_candles(pair, count, granularity)
@@ -961,12 +978,19 @@ async def trading_loop_pair(pair, app):
 
         except Exception as e:
             err_str = str(e)
+            # Pair tidak tersedia — nonaktifkan permanen
             if "Insufficient authorization" in err_str:
                 unavailable_pairs.add(pair)
                 stop_pair(pair)
                 await app.bot.send_message(ALLOWED_USER_ID,
                     "{} dinonaktifkan — pair tidak tersedia di akun ini.".format(pair_label(pair)))
                 return
+            # Server error sementara (5xx, timeout) — log saja, tidak notif Telegram
+            if any(x in err_str for x in ("500 ", "502 ", "503 ", "504 ", "Timeout", "Connection error")):
+                logger.warning("[%s] Server error sementara: %s", pair, err_str[:80])
+                await asyncio.sleep(settings["check_interval"])
+                continue
+            # Error lain — notif Telegram
             logger.error("[%s] %s", pair, e)
             try:
                 await app.bot.send_message(ALLOWED_USER_ID,
@@ -1632,12 +1656,18 @@ async def post_init(app):
         logger.info("Balance awal: $%.2f", peak_balance)
     except Exception as e:
         logger.error("post_init account: %s", e)
-    asyncio.create_task(monitor_daily_loss(app))
-    asyncio.create_task(monitor_margin(app))
-    asyncio.create_task(monitor_drawdown(app))
-    asyncio.create_task(auto_summary(app))
-    asyncio.create_task(asyncio.to_thread(fetch_news))
-    logger.info("Bot v4 siap.")
+
+    # Simpan referensi task supaya tidak di-garbage collect
+    app.bot_data["bg_tasks"] = [
+        asyncio.create_task(monitor_daily_loss(app), name="monitor_daily_loss"),
+        asyncio.create_task(monitor_margin(app),     name="monitor_margin"),
+        asyncio.create_task(monitor_drawdown(app),   name="monitor_drawdown"),
+        asyncio.create_task(auto_summary(app),       name="auto_summary"),
+    ]
+    # Pre-fetch news di background thread
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, fetch_news)
+    logger.info("Bot v4 siap. Background tasks: %d", len(app.bot_data["bg_tasks"]))
 
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(post_init).build()
